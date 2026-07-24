@@ -107,6 +107,25 @@ interface Pending {
   label: string;
 }
 
+/** Mirror of the batch job in storage — see lib/jobs.ts. Read-only here. */
+interface JobView {
+  id: string;
+  goal: string;
+  total: number;
+  done: number;
+  failed: number;
+  review: number;
+  state: 'collecting' | 'sampling' | 'running' | 'paused' | 'done' | 'cancelled';
+  irreversible: boolean;
+  approved: boolean;
+  sample?: string;
+  current?: string;
+}
+
+function jobControl(action: string) {
+  browser.runtime.sendMessage({ type: 'tidra-job', action }).catch(() => {});
+}
+
 const IconArrowUp = () => (
   <svg width="17" height="17" viewBox="0 0 24 24" fill="none">
     <path d="M12 19V5M6 11l6-6 6 6" stroke="currentColor" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round" />
@@ -219,6 +238,7 @@ export function Island() {
   const [input, setInput] = useState('');
   const [chat, setChat] = useState<ChatState>(EMPTY);
   const [pending, setPending] = useState<Pending | null>(null);
+  const [job, setJob] = useState<JobView | null>(null);
   const [unread, setUnread] = useState(false);
   const [reactions, setReactions] = useState<Record<number, 'up' | 'down' | undefined>>({});
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
@@ -413,10 +433,12 @@ export function Island() {
         'tidraUnread',
         'tidraStatus',
         'tidraAuto',
+        'tidraJob',
       ])
-      .then(({ tidraOpen, tidraChat, tidraPending, tidraIslandPos, tidraPanelPos, tidraPanelSize, tidraUnread, tidraStatus, tidraAuto }) => {
+      .then(({ tidraOpen, tidraChat, tidraPending, tidraIslandPos, tidraPanelPos, tidraPanelSize, tidraUnread, tidraStatus, tidraAuto, tidraJob }) => {
         if (typeof tidraStatus === 'string') setStatus(tidraStatus);
         setAuto(tidraAuto === true);
+        if (tidraJob) setJob(tidraJob as JobView);
         if (tidraOpen) setOpen(true);
         if (tidraChat) setChat(tidraChat as ChatState);
         if (tidraPending) setPending(tidraPending as Pending);
@@ -433,6 +455,7 @@ export function Island() {
       if (changes.tidraAuto) setAuto(changes.tidraAuto.newValue === true);
       if (changes.tidraOpen) setOpen(!!changes.tidraOpen.newValue);
       if (changes.tidraPending) setPending((changes.tidraPending.newValue as Pending) ?? null);
+      if (changes.tidraJob) setJob((changes.tidraJob.newValue as JobView) ?? null);
       if (changes.tidraUnread) setUnread(!!changes.tidraUnread.newValue);
     };
     browser.storage.onChanged.addListener(onChanged);
@@ -627,6 +650,95 @@ export function Island() {
     }
   }
 
+  // A batch job is the one thing that outlives a single turn, so it gets its
+  // own strip of UI: what it is, how far in, and the controls to stop it.
+  const jobBusy = !!job && ['collecting', 'sampling', 'running', 'paused'].includes(job.state);
+
+  function renderJobBar() {
+    if (!job || job.state === 'cancelled') return null;
+    const settled = job.done + job.failed + job.review;
+    const pct = job.total ? Math.round((settled / job.total) * 100) : 0;
+
+    if (job.state === 'collecting') {
+      return (
+        <div className="tidra-job">
+          <span className="tidra-job-line">
+            Building the list<i />
+            <i />
+            <i />
+          </span>
+        </div>
+      );
+    }
+
+    // The gate. Before the first item for a reversible batch; after the first
+    // one is drafted for anything that sends, so there is something real to judge.
+    if (job.state === 'sampling') {
+      const approving = !!job.sample;
+      return (
+        <div className="tidra-job">
+          <span className="tidra-job-line">
+            {approving
+              ? `Approve this one and I'll do the other ${job.total - 1} the same way.`
+              : `${job.total} item${job.total === 1 ? '' : 's'} ready.`}
+          </span>
+          <div className="tidra-job-btns">
+            <button className="tidra-confirm-no" onClick={() => jobControl('cancel')}>
+              ✕ Cancel
+            </button>
+            <button
+              className="tidra-confirm-yes"
+              onClick={() => jobControl(approving ? 'approve' : 'start')}
+            >
+              {approving ? `✓ Do all ${job.total}` : `▶ Start ${job.total}`}
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    if (job.state === 'done') {
+      return (
+        <div className="tidra-job">
+          <span className="tidra-job-line">
+            Finished — {job.done} of {job.total}
+            {job.failed ? ` · ${job.failed} failed` : ''}
+            {job.review ? ` · ${job.review} to check` : ''}
+          </span>
+          <div className="tidra-job-btns">
+            <button className="tidra-job-ghost" onClick={() => jobControl('dismiss')}>
+              Dismiss
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    const running = job.state === 'running';
+    return (
+      <div className="tidra-job">
+        <div className="tidra-job-track">
+          <div className="tidra-job-fill" style={{ width: `${pct}%` }} />
+        </div>
+        <span className="tidra-job-line">
+          <b>
+            {settled}/{job.total}
+          </b>
+          {job.failed ? ` · ${job.failed} failed` : ''}
+          {running && job.current ? ` · ${job.current}` : running ? '' : ' · paused'}
+        </span>
+        <div className="tidra-job-btns">
+          <button className="tidra-job-ghost" onClick={() => jobControl('cancel')}>
+            Stop
+          </button>
+          <button className="tidra-job-ghost" onClick={() => jobControl(running ? 'pause' : 'resume')}>
+            {running ? 'Pause' : 'Resume'}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   const lastMsg = chat.messages[chat.messages.length - 1];
   const showSettingsLink = lastMsg?.role === 'error' && /API key/i.test(lastMsg.text);
 
@@ -655,7 +767,10 @@ export function Island() {
 
     const lastAssistant = [...chat.messages].reverse().find((m) => m.role !== 'user');
     const lastUser = [...chat.messages].reverse().find((m) => m.role === 'user');
-    const showCard = !chat.loading && unread && lastAssistant;
+    // A running job takes over the card slot: it outlives the turn that started
+    // it, so "loading" is the wrong signal — the job's own state is.
+    const showJob = jobBusy && !chat.loading;
+    const showCard = !chat.loading && !showJob && unread && lastAssistant;
     // While it works, the same card slot shows the request and the live step.
     const showWorking = chat.loading && lastUser;
     // Keep the answer card fully on screen — when the island is near the right
@@ -675,7 +790,9 @@ export function Island() {
         <button
           ref={islandRef as React.RefObject<HTMLButtonElement>}
           className={
-            'tidra-island' + (chat.loading ? ' tidra-island-busy' : '') + (pos ? ' tidra-island-free' : '')
+            'tidra-island' +
+            (chat.loading || job?.state === 'running' ? ' tidra-island-busy' : '') +
+            (pos ? ' tidra-island-free' : '')
           }
           style={posStyle}
           onPointerDown={onPointerDown}
@@ -705,6 +822,38 @@ export function Island() {
             </>
           )}
         </button>
+
+        {showJob && (
+          <div
+            className={'tidra-card tidra-card-working' + (pos ? ' tidra-card-free' : '')}
+            style={cardStyle}
+            onClick={() => setOpenPersist(true)}
+            role="button"
+            tabIndex={0}
+            aria-label="Open Tidra to see the batch"
+          >
+            <span className="tidra-card-body">
+              <span className="tidra-card-task">{job!.goal.replace(/\s+/g, ' ').trim()}</span>
+              {job!.state === 'running' ? (
+                <span className="tidra-card-step">
+                  {job!.done + job!.failed + job!.review}/{job!.total}
+                  {job!.current ? ` · ${job!.current}` : ''}
+                  <i />
+                  <i />
+                  <i />
+                </span>
+              ) : (
+                <span className="tidra-card-step">
+                  {job!.state === 'paused'
+                    ? `Paused at ${job!.done}/${job!.total}`
+                    : job!.state === 'sampling'
+                      ? 'Waiting for you'
+                      : 'Building the list'}
+                </span>
+              )}
+            </span>
+          </div>
+        )}
 
         {showWorking && (
           <div
@@ -893,6 +1042,8 @@ export function Island() {
           </button>
         )}
       </div>
+
+      {renderJobBar()}
 
       {pending && (
         <div className="tidra-confirm">

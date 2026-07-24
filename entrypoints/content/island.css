@@ -665,6 +665,88 @@
   cursor: default;
 }
 
+/* Batch job strip — a long run is the one thing that outlives a turn, so it
+   gets a persistent home above the composer rather than a chat message. */
+.tidra-job {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 13px 16px;
+  margin: 4px 14px 10px;
+  background: #f2f2f7;
+  border-radius: 18px;
+}
+
+.tidra-job-track {
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(120, 120, 128, 0.2);
+  overflow: hidden;
+}
+
+.tidra-job-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: #8fd44f;
+  transition: width 0.35s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.tidra-job-line {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  font-size: 13.5px;
+  letter-spacing: -0.01em;
+  color: rgba(60, 60, 67, 0.75);
+}
+
+.tidra-job-line b {
+  font-weight: 600;
+  color: #1c1c1e;
+}
+
+/* Same three-dot pulse the island uses while it works. */
+.tidra-job-line i {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: rgba(60, 60, 67, 0.55);
+  animation: tidra-island-dot 1.2s ease-in-out infinite;
+}
+.tidra-job-line i:nth-of-type(2) { animation-delay: 0.18s; }
+.tidra-job-line i:nth-of-type(3) { animation-delay: 0.36s; }
+
+.tidra-job-btns {
+  display: flex;
+  gap: 9px;
+}
+
+.tidra-job-btns button {
+  flex: 1;
+  border-radius: 14px;
+  padding: 9px 12px;
+  font-size: 14px;
+  font-weight: 590;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  transition: transform 0.12s ease, opacity 0.12s ease;
+}
+
+.tidra-job-btns button:active {
+  transform: scale(0.97);
+}
+
+/* Pause / Resume / Stop are secondary next to the green approve. */
+.tidra-job-ghost {
+  border: none;
+  background: rgba(120, 120, 128, 0.16);
+  color: rgba(60, 60, 67, 0.9);
+}
+
+.tidra-job-ghost:hover {
+  background: rgba(120, 120, 128, 0.24);
+}
+
 /* Composer — Dia-style rounded pill with inline icons */
 .tidra-inputbar {
   position: relative; /* anchors the Manual/Auto popover */

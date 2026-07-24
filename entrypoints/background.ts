@@ -10,6 +10,25 @@ import {
   type Tool,
   type ToolResultBlock,
 } from '../lib/llm';
+import {
+  MAX_ITEMS,
+  allItems,
+  claimNext,
+  clearJob,
+  estimate,
+  humanDuration,
+  itemsFromCsv,
+  loadJob,
+  newJob,
+  reconcile,
+  requeue,
+  retrySweep,
+  saveJob,
+  setItems,
+  settle,
+  type Job,
+  type JobItem,
+} from '../lib/jobs';
 
 interface PageContext {
   title: string;
@@ -825,6 +844,13 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   const reqOpts = { signal: abort.signal };
 
   try {
+  // Repeated work over many targets can't run as one conversation — it becomes
+  // a durable job instead. Only "act" requests are ever candidates.
+  if (message.intent !== 'chat' && (await maybeStartJob(apiKey, tier, message, abort.signal))) {
+    await clearLoading();
+    return;
+  }
+
   // Decide route: explicit hint (quick actions) or the cheap Haiku router.
   const route: 'chat' | 'act' =
     message.intent ?? (await classify(apiKey, tier.router, message.prompt, history, abort.signal));
@@ -1145,7 +1171,633 @@ async function runRoutine() {
   }
 }
 
+// ─── Batch jobs ─────────────────────────────────────────────────────────────
+// "Send 10 connection requests", "write 1000 emails". One agent conversation
+// cannot do this: the step budget runs out, the context grows without bound,
+// and the service worker is killed long before item 1000. So the model stops
+// being the orchestrator and becomes a per-item function — deterministic code
+// owns the loop, and the loop's state lives in storage (see lib/jobs.ts).
+//
+// Shape of a run:
+//   plan  → one cheap call: is this a batch, and what is ONE item?
+//   collect → build the real work list (from an attachment, or off the page)
+//   approve → show the count, the cost, and a real drafted sample
+//   pump  → one item per turn, each claimed and settled on its own
+//   report → what landed, what failed, what needs eyes
+
+const JOB_ALARM = 'tidra-job-tick';
+/** A pump that hasn't touched its job in this long is presumed dead. */
+const BEAT_STALE_MS = 90_000;
+
+/** Cheap prefilter, so an ordinary message never pays for a planner call. */
+function looksBatch(prompt: string): boolean {
+  const p = prompt.toLowerCase();
+  if (/^confirmed\s+—/.test(p.trim())) return false;
+  if (/\b(all|each|every|everyone|everybody|bulk|mass)\b/.test(p)) return true;
+  // A standalone count of 3 or more: "send 10 …", "write 1000 emails".
+  return /\b([3-9]|\d{2,})\b/.test(p);
+}
+
+interface JobPlan {
+  batch: boolean;
+  count?: number;
+  task?: string;
+  site?: string;
+  source?: 'attachment' | 'page' | 'prompt' | 'unknown';
+  irreversible?: boolean;
+  labels?: string[];
+  missing?: string;
+}
+
+/** Pull the first JSON object out of a reply that may be wrapped in prose. */
+function extractJson<T>(text: string): T | null {
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  try {
+    return JSON.parse(text.slice(start, end + 1)) as T;
+  } catch {
+    return null;
+  }
+}
+
+const PLANNER_SYSTEM = `You split a user's request into a repeated unit of work, if it is one. Reply with JSON only — no prose, no code fence.
+
+{
+  "batch": true | false,
+  "count": <how many times, best estimate; 0 if unknown>,
+  "task": "<the instruction for ONE item, written so it reads correctly with that item's details appended>",
+  "site": "<https:// URL where the work happens, or omit>",
+  "source": "attachment" | "page" | "prompt" | "unknown",
+  "irreversible": true | false,
+  "labels": ["<item>", "..."],
+  "missing": "<one short question, only when source is unknown>"
+}
+
+batch is true only for genuinely repeated work over MULTIPLE targets (3 or more). A single multi-step task ("book a flight", "reply to this email") is NOT a batch — it is one item, so batch is false.
+
+source — where the list of targets comes from:
+- "attachment": the user attached a file holding the list (a CSV of recipients, etc).
+- "page": the targets are on a website and must be collected from it first (people in a LinkedIn list, emails in an inbox, rows in a dashboard).
+- "prompt": the user named every target themselves; put them in "labels".
+- "unknown": there is no list anywhere. NEVER invent the targets — set "missing" to the one question that would produce them.
+
+irreversible is true when finishing ONE item sends, posts, submits, buys, applies for, connects, or deletes something. Drafting, saving, reading and collecting are not irreversible.`;
+
+async function planJob(
+  apiKey: string,
+  model: string,
+  prompt: string,
+  page: PageContext,
+  hasAttachment: boolean,
+  signal?: AbortSignal,
+): Promise<JobPlan | null> {
+  try {
+    const res = await callModel(
+      apiKey,
+      {
+        model,
+        max_tokens: 700,
+        system: PLANNER_SYSTEM,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              `Request: ${prompt}`,
+              `Current page: ${page.title} — ${page.url}`,
+              hasAttachment ? 'The user attached a file with this message.' : 'No file attached.',
+            ].join('\n'),
+          },
+        ],
+      },
+      signal,
+    );
+    return extractJson<JobPlan>(extractText(res.content));
+  } catch {
+    return null; // planning is an optimisation — never block the normal path on it
+  }
+}
+
+const RECORD_ITEMS: Tool = {
+  name: 'record_items',
+  description:
+    'Write down the list of things to work through, once you can see all of them. Call this exactly once, then stop.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      items: {
+        type: 'array',
+        description: 'One entry per target, in the order they should be handled.',
+        items: {
+          type: 'object',
+          properties: {
+            label: { type: 'string', description: 'How a human identifies it — a name, an email, a subject line.' },
+            url: { type: 'string', description: 'Direct link to this item, if the page gives one.' },
+            note: { type: 'string', description: 'Anything about this item the task will need (role, company, context).' },
+          },
+          required: ['label'],
+        },
+      },
+    },
+    required: ['items'],
+  },
+};
+
+const COLLECT_SYSTEM = `You are Tidra, building a work list before a batch runs. Your ONLY job right now is to find the targets and write them down — do not act on any of them.
+
+Use snapshot() to read the page, scroll() and a fresh snapshot to reach ones that are offscreen or lazily loaded, and get_page() to read text. Keep going until you can see the number asked for, or until the page has no more to give.
+
+Then call record_items once with everything you found, in page order. Never invent an entry, and never pad the list to hit the number — fewer real targets is correct, made-up ones are not.`;
+
+/** Walk the site and let the model write down the actual targets. */
+async function collectItems(
+  apiKey: string,
+  model: string,
+  job: Job,
+  want: number,
+  tabId: number,
+): Promise<{ label: string; key: string; data: Record<string, string> }[]> {
+  const tabState: TabState = { tabId };
+  const tools = [
+    ...TOOLS.filter((t) => ['snapshot', 'scroll', 'get_page', 'click_text', 'go_back'].includes(t.name)),
+    RECORD_ITEMS,
+  ];
+  const messages: Message[] = [
+    {
+      role: 'user',
+      content: [
+        `The user asked: ${job.goal}`,
+        ``,
+        `Find the ${want > 0 ? want : ''} targets this applies to on this page and record them.`,
+        `Each item will later be handled with: ${job.task}`,
+        ``,
+        await snapshotAllFrames(tabId),
+      ].join('\n'),
+    },
+  ];
+
+  const snapshotIds = new Set<string>();
+  let guard = 0;
+  while (guard++ < 16) {
+    const res = await callModel(apiKey, { model, max_tokens: 2000, system: COLLECT_SYSTEM, messages, tools });
+    if (res.stop_reason !== 'tool_use') return [];
+
+    const recorded = (res.content as any[]).find((b) => b.type === 'tool_use' && b.name === 'record_items');
+    if (recorded) {
+      const raw = Array.isArray(recorded.input?.items) ? recorded.input.items : [];
+      return raw.slice(0, MAX_ITEMS).map((r: any) => {
+        const label = String(r?.label ?? '').trim();
+        const data: Record<string, string> = {};
+        if (r?.url) data.url = String(r.url);
+        if (r?.note) data.note = String(r.note);
+        return { label, key: (r?.url ? String(r.url) : label).toLowerCase(), data };
+      });
+    }
+
+    messages.push({ role: 'assistant', content: res.content as any });
+    const results: ToolResultBlock[] = [];
+    for (const block of res.content as any[]) {
+      if (block.type !== 'tool_use') continue;
+      await setStatus('Building the list');
+      const r = await execTool(block.name, block.input, tabState);
+      if (SNAPSHOT_TOOLS.has(block.name)) snapshotIds.add(block.id);
+      results.push({ type: 'tool_result', tool_use_id: block.id, content: r.content, is_error: r.isError });
+    }
+    if (!results.length) return [];
+    messages.push({ role: 'user', content: results });
+    pruneOldSnapshots(messages, snapshotIds);
+  }
+  return [];
+}
+
+const FINISH_ITEM: Tool = {
+  name: 'finish_item',
+  description:
+    'End your work on this ONE item. Call it as soon as the item is complete, or as soon as you are certain it cannot be done.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      status: {
+        type: 'string',
+        enum: ['done', 'failed', 'skipped'],
+        description: 'done = finished. failed = tried and could not. skipped = it should not be done at all.',
+      },
+      result: { type: 'string', description: 'One line: what you did, or why you could not.' },
+    },
+    required: ['status', 'result'],
+  },
+};
+
+const JOB_ITEM_SYSTEM = `You are Tidra, working through a long list of near-identical tasks. This turn handles exactly ONE item and nothing else.
+
+You are on a tab opened for this job. Ignore everything on the page that belongs to other items — do not wander, do not "helpfully" handle the next one, do not summarise the list.
+
+Use snapshot() to see the page's interactive elements (refs like ref_0-12), then click(ref) / fill(ref, text). Refs go stale whenever the page changes, so snapshot again after anything that navigates or re-renders. Every action reports what changed; "no visible change" means it did not work — try something else rather than continuing as if it had.
+
+Write real content that fits this specific item. It is one of many, but the person receiving it only ever sees this one, so it must not read as a form letter — use the item's own details.
+
+Work fast and finish: you have a small step budget per item. Call finish_item as soon as this item is complete, or as soon as you are sure it cannot be done. Do not ask the user questions — there is nobody watching an individual item.`;
+
+const JOB_SAMPLE_RULE = `\n\nTHIS ITEM IS THE SAMPLE. Draft everything, then STOP before the irreversible step — do not click Send/Post/Submit/Connect. Call confirm_action with a summary that QUOTES what you drafted, so the user can approve this one and the rest of the batch from it.`;
+
+const JOB_APPROVED_RULE = `\n\nThe user has already approved this batch, including the final send. Complete the item all the way — click the Send/Post/Submit button yourself. Do not call confirm_action.`;
+
+/** Run one item to completion in the job's tab. */
+async function runJobItem(
+  apiKey: string,
+  model: string,
+  job: Job,
+  item: JobItem,
+  profileText: string,
+): Promise<{ status: 'done' | 'failed' | 'review'; result: string; sample?: string }> {
+  const tabId = job.tabId!;
+  const tabState: TabState = { tabId };
+
+  // Deterministic setup: put the tab where the item starts before the model
+  // gets a turn. This is a step the model no longer has to spend, times N.
+  const start = item.data?.url || job.site;
+  if (start) {
+    try {
+      await browser.tabs.update(tabId, { url: start });
+      await waitForTabLoad(tabId);
+      await sleep(400);
+    } catch {
+      return { status: 'failed', result: `Could not open ${start}` };
+    }
+  }
+
+  const details = Object.entries(item.data ?? {})
+    .filter(([k]) => k !== 'url')
+    .map(([k, v]) => `${k}: ${v}`)
+    .join('\n');
+
+  const messages: Message[] = [
+    {
+      role: 'user',
+      content: [
+        `Item ${item.i + 1} of ${job.total}: ${item.label}`,
+        details ? `\nWhat is known about it:\n${details}` : '',
+        `\nTask for this item: ${job.task}`,
+        `\nThe wider goal, for context only: ${job.goal}`,
+        ``,
+        await snapshotAllFrames(tabId),
+      ].join('\n'),
+    },
+  ];
+
+  const sampling = job.irreversible && !job.approved;
+  const tools = [
+    ...TOOLS.filter((t) => {
+      if (t.name === 'screenshot') return false; // a background tab cannot be captured
+      if (t.name === 'confirm_action') return sampling;
+      return true;
+    }),
+    FINISH_ITEM,
+  ];
+  const system =
+    JOB_ITEM_SYSTEM + profileText + (sampling ? JOB_SAMPLE_RULE : job.approved ? JOB_APPROVED_RULE : '');
+
+  const snapshotIds = new Set<string>();
+  let guard = 0;
+  while (guard++ < job.stepsPerItem) {
+    const res = await callModel(apiKey, { model, max_tokens: 1600, system, messages, tools });
+
+    if (res.stop_reason !== 'tool_use') {
+      // Ended with prose. Treat it as the outcome rather than losing the work.
+      return { status: 'done', result: extractText(res.content as ContentBlock[]).slice(0, 300) || 'Done.' };
+    }
+
+    const blocks = res.content as any[];
+    const confirm = blocks.find((b) => b.type === 'tool_use' && b.name === 'confirm_action');
+    if (confirm) {
+      const pre = extractText(res.content as ContentBlock[]);
+      const summary = confirm.input?.summary || pre || 'Ready to go.';
+      return { status: 'review', result: 'Drafted, waiting for approval.', sample: summary };
+    }
+
+    const finish = blocks.find((b) => b.type === 'tool_use' && b.name === 'finish_item');
+    if (finish) {
+      const status = finish.input?.status === 'done' ? 'done' : 'failed';
+      return { status, result: String(finish.input?.result ?? '').slice(0, 300) || 'Done.' };
+    }
+
+    messages.push({ role: 'assistant', content: blocks as any });
+    const results: ToolResultBlock[] = [];
+    for (const block of blocks) {
+      if (block.type !== 'tool_use') continue;
+      await setStatus(`${job.done + 1}/${job.total} · ${item.label.slice(0, 28)}`);
+      const r = await execTool(block.name, block.input, tabState, job.approved);
+      if (SNAPSHOT_TOOLS.has(block.name)) snapshotIds.add(block.id);
+      results.push({ type: 'tool_result', tool_use_id: block.id, content: r.content, is_error: r.isError });
+    }
+    if (!results.length) {
+      return { status: 'done', result: extractText(res.content as ContentBlock[]).slice(0, 300) || 'Done.' };
+    }
+    messages.push({ role: 'user', content: results });
+    pruneOldSnapshots(messages, snapshotIds);
+  }
+
+  // Out of steps on ONE item. That is a stuck item, not a stuck job — the rest
+  // of the list is unaffected, which is the entire point of the per-item budget.
+  return { status: 'failed', result: `Ran out of steps on this one after ${job.stepsPerItem} tries.` };
+}
+
+/** The job's own tab, so a long run never fights the user for the page in front. */
+async function ensureJobTab(job: Job): Promise<number> {
+  if (job.tabId != null) {
+    const tab = await browser.tabs.get(job.tabId).catch(() => null);
+    if (tab?.id != null) return tab.id;
+  }
+  const tab = await browser.tabs.create({ url: job.site || 'about:blank', active: false });
+  if (tab.id == null) throw new Error('Could not open a tab for the job.');
+  job.tabId = tab.id;
+  await waitForTabLoad(tab.id);
+  await saveJob(job);
+  return tab.id;
+}
+
+async function setJobState(job: Job, state: Job['state']): Promise<Job> {
+  job.state = state;
+  await saveJob(job);
+  return job;
+}
+
+/**
+ * The pump. Runs items back-to-back while the worker is alive, re-reading the
+ * job each lap so Pause and Cancel from the UI take effect immediately. If the
+ * worker dies mid-run, the watchdog alarm restarts this within a minute.
+ */
+let pumping = false;
+async function pumpJob(): Promise<void> {
+  if (pumping) return;
+  pumping = true;
+  try {
+    const setup = await modelSetup();
+    if (!setup) {
+      // Park the job rather than returning: the watchdog would otherwise wake
+      // every minute forever, retrying something that cannot succeed, silently.
+      const stalled = await loadJob();
+      if (stalled) {
+        await setJobState(stalled, 'paused');
+        await browser.alarms.clear(JOB_ALARM).catch(() => {});
+        await pushChat('The batch is paused — there is no API key set. Add one in settings and press Resume.', 'error');
+      }
+      return;
+    }
+    const profileText = await profilePreamble();
+
+    for (;;) {
+      let job = await loadJob();
+      if (!job || job.state !== 'running') return;
+
+      const item = await claimNext(job);
+      if (!item) {
+        if (await retrySweep(job)) continue; // one sweep over reversible failures
+        await finishJob(job);
+        return;
+      }
+
+      await ensureJobTab(job);
+      let outcome: { status: 'done' | 'failed' | 'review'; result: string; sample?: string };
+      try {
+        outcome = await runJobItem(setup.apiKey, setup.tier.act, job, item, profileText);
+      } catch (err) {
+        outcome = { status: 'failed', result: err instanceof Error ? err.message : String(err) };
+      }
+
+      // The sample came back drafted, not sent — park the job on the user.
+      if (outcome.sample) {
+        job.sample = outcome.sample;
+        await requeue(job, item); // nothing was sent, so this item is untouched work
+        await setJobState(job, 'sampling');
+        await pushChat(
+          `${outcome.sample}\n\nThis is item 1 of ${job.total}. Approve it and I'll run the remaining ${job.total - 1} the same way.`,
+          'assistant',
+        );
+        await setStatus(null);
+        return;
+      }
+
+      await settle(job, item, outcome.status, outcome.result);
+      const after = await loadJob();
+      if (!after || after.state !== 'running') return;
+      if (job.throttleMs) await sleep(job.throttleMs);
+    }
+  } finally {
+    pumping = false;
+  }
+}
+
+/** Final report: counts first, then the handful of things that need a human. */
+async function finishJob(job: Job): Promise<void> {
+  job.state = 'done';
+  job.finishedAt = Date.now();
+  job.current = undefined;
+  await saveJob(job);
+  await browser.alarms.clear(JOB_ALARM).catch(() => {});
+
+  const items = await allItems(job);
+  const failed = items.filter((i) => i.state === 'failed');
+  const review = items.filter((i) => i.state === 'review');
+  const lines = [`✅ Finished — ${job.done} of ${job.total} done.`];
+  if (failed.length) {
+    lines.push(
+      `\n**${failed.length} failed:**\n` +
+        failed.slice(0, 8).map((i) => `- ${i.label} — ${i.result ?? 'no reason recorded'}`).join('\n') +
+        (failed.length > 8 ? `\n- …and ${failed.length - 8} more` : ''),
+    );
+  }
+  if (review.length) {
+    lines.push(
+      `\n**${review.length} need checking** (interrupted mid-action, so I won't retry them):\n` +
+        review.slice(0, 8).map((i) => `- ${i.label}`).join('\n') +
+        (review.length > 8 ? `\n- …and ${review.length - 8} more` : ''),
+    );
+  }
+  await pushChat(lines.join('\n'), 'assistant');
+  await setStatus(null);
+}
+
+/**
+ * Decide whether a request is a batch and, if so, take it over. Returns true
+ * when the job path has claimed the request — the normal agent never runs.
+ */
+async function maybeStartJob(
+  apiKey: string,
+  tier: { chat: string; act: string; router: string },
+  message: AskRequest,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (!looksBatch(message.prompt)) return false;
+  const existing = await loadJob();
+  if (existing && ['collecting', 'sampling', 'running', 'paused'].includes(existing.state)) return false;
+  // A finished job the user never dismissed still owns its item chunks. Drop
+  // them here or every batch ever run stays in storage forever.
+  if (existing) await clearJob(existing);
+
+  const textFiles = (message.attachments ?? []).filter((a) => a.kind === 'text');
+  const plan = await planJob(apiKey, tier.act, message.prompt, message.page, textFiles.length > 0, signal);
+  if (!plan?.batch || !plan.task) return false;
+
+  // No list, and no way to get one. Asking beats inventing 1000 addresses.
+  if (plan.source === 'unknown') {
+    await pushChat(
+      plan.missing?.trim() ||
+        'I can run that as a batch, but I need the list first — attach a CSV, or point me at the page the targets are on.',
+      'assistant',
+    );
+    return true;
+  }
+
+  const job = newJob({
+    goal: message.prompt,
+    task: plan.task,
+    site: plan.site || (/^https?:/i.test(message.page.url) ? message.page.url : undefined),
+    irreversible: plan.irreversible !== false,
+  });
+  await saveJob(job);
+  await setStatus('Building the list');
+
+  // Build the work list. Where it comes from decides how much this costs: a
+  // file or an enumerated prompt is free, a page costs one collection turn.
+  let items: { label: string; key: string; data: Record<string, string> }[] = [];
+  if (plan.source === 'attachment' && textFiles.length) {
+    items = textFiles.flatMap((f) => itemsFromCsv(f.data));
+  } else if (plan.source === 'prompt' && plan.labels?.length) {
+    items = plan.labels.map((l) => ({ label: String(l), key: String(l).toLowerCase(), data: {} }));
+  } else {
+    const tabId = await ensureJobTab(job);
+    if (job.site) {
+      await browser.tabs.update(tabId, { url: job.site }).catch(() => {});
+      await waitForTabLoad(tabId);
+      await sleep(500);
+    }
+    items = await collectItems(apiKey, tier.act, job, plan.count ?? 0, tabId);
+  }
+
+  if (!items.length) {
+    await clearJob(job);
+    await pushChat(
+      "I couldn't build the list for that — I didn't find the targets on the page, and nothing was attached. Point me at the right page, or attach a CSV, and I'll run it.",
+      'assistant',
+    );
+    await setStatus(null);
+    return true;
+  }
+
+  await setItems(job, items);
+  await setJobState(job, 'sampling');
+
+  const est = estimate(job);
+  const cost = est.dollars < 0.01 ? 'under a cent' : `about $${est.dollars.toFixed(2)}`;
+  await pushChat(
+    [
+      `**${job.total} item${job.total === 1 ? '' : 's'}** to work through: ${items
+        .slice(0, 3)
+        .map((i) => i.label)
+        .join(', ')}${job.total > 3 ? `, +${job.total - 3} more` : ''}.`,
+      ``,
+      `Each one: ${job.task}`,
+      ``,
+      `Roughly ${humanDuration(est.minutes)} and ${cost} in model usage.` +
+        (job.irreversible ? " I'll draft the first one and show it to you before anything is sent." : ''),
+    ].join('\n'),
+    'assistant',
+  );
+  await setStatus(null);
+  return true;
+}
+
+/** Start (or restart) the pump, with the watchdog alarm behind it. */
+async function startPump(job: Job): Promise<void> {
+  job.state = 'running';
+  job.startedAt ??= Date.now();
+  job.beat = Date.now();
+  await saveJob(job);
+  // The alarm is a resurrection mechanism, not the clock: alarms are clamped to
+  // minutes, and 1000 items at a minute each would take a week. The pump runs
+  // flat out in memory; the alarm only matters if the worker is killed.
+  browser.alarms.create(JOB_ALARM, { periodInMinutes: 1 });
+  void pumpJob();
+}
+
+/** Watchdog: did a pump die holding the job? */
+async function jobWatchdog(): Promise<void> {
+  const job = await loadJob();
+  if (!job) {
+    await browser.alarms.clear(JOB_ALARM).catch(() => {});
+    return;
+  }
+  if (job.state !== 'running') return;
+  // `pumping` is per worker instance: if this worker has a live pump, the job
+  // is fine and a second pump would double-run items. If the flag is false
+  // while the job says "running", the worker that owned it is gone.
+  if (pumping) return;
+  if (Date.now() - (job.beat ?? 0) < BEAT_STALE_MS) return; // a fresh start still settling
+  await reconcile(job);
+  void pumpJob();
+}
+
+async function handleJobControl(action: string): Promise<void> {
+  const job = await loadJob();
+  if (!job) return;
+
+  if (action === 'start' || action === 'approve') {
+    // "approve" is the user signing off on the drafted sample — from here the
+    // batch may complete its own sends. Manual mode gets the draft first; auto
+    // mode said up front that it doesn't want to be asked.
+    const { tidraAuto } = await browser.storage.local.get('tidraAuto');
+    if (action === 'approve' || tidraAuto === true || !job.irreversible) {
+      job.approved = true;
+      job.sample = undefined;
+    }
+    await startPump(job);
+    return;
+  }
+  if (action === 'pause') {
+    job.current = undefined;
+    await setJobState(job, 'paused');
+    await setStatus(null);
+    await browser.alarms.clear(JOB_ALARM).catch(() => {});
+    return;
+  }
+  if (action === 'resume') {
+    await reconcile(job);
+    await startPump(job);
+    return;
+  }
+  if (action === 'cancel') {
+    await setJobState(job, 'cancelled');
+    await browser.alarms.clear(JOB_ALARM).catch(() => {});
+    await setStatus(null);
+    if (job.tabId != null) browser.tabs.remove(job.tabId).catch(() => {});
+    await pushChat(
+      job.done ? `Stopped. ${job.done} of ${job.total} were done before I stopped.` : 'Stopped — nothing was sent.',
+      'assistant',
+    );
+    await clearJob(job);
+    return;
+  }
+  if (action === 'dismiss') {
+    await clearJob(job);
+  }
+}
+
 export default defineBackground(() => {
+  // A worker that was killed mid-job comes back here. Anything left `doing` is
+  // judged before a single new item starts.
+  void (async () => {
+    const job = await loadJob();
+    if (job?.state === 'running') {
+      await reconcile(job);
+      void pumpJob();
+    }
+  })();
+
+  browser.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === JOB_ALARM) void jobWatchdog();
+  });
+
   browser.commands.onCommand.addListener(async (command) => {
     if (command !== 'toggle-island') return;
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
@@ -1171,6 +1823,14 @@ export default defineBackground(() => {
         sendResponse({ route });
       })().catch(() => sendResponse({ route: 'chat' }));
       return true;
+    }
+    // Batch job controls from the island: start / approve / pause / resume /
+    // cancel / dismiss.
+    if (message?.type === 'tidra-job' && typeof message.action === 'string') {
+      handleJobControl(message.action)
+        .catch((err) => pushChat(err instanceof Error ? err.message : String(err), 'error'))
+        .finally(() => sendResponse({ ok: true }));
+      return true; // keep the worker alive for the async work
     }
     if (message?.type === 'tidra-stop') {
       currentAbort?.abort(); // cancel the in-flight API request

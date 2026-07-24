@@ -13,7 +13,19 @@ export default defineConfig({
       48: 'icon/48.png',
       128: 'icon/128.png',
     },
-    permissions: ['storage', 'activeTab', 'scripting', 'tabs', 'favicon', 'webNavigation', 'unlimitedStorage'],
+    // "alarms" is what makes long batch jobs survivable: the service worker is
+    // killed after ~30s idle, and the alarm is what wakes it back up to carry
+    // on from where the job's stored state left off.
+    permissions: [
+      'storage',
+      'activeTab',
+      'scripting',
+      'tabs',
+      'favicon',
+      'webNavigation',
+      'unlimitedStorage',
+      'alarms',
+    ],
     // <all_urls> is what the content script already matches; it additionally
     // lets the background enumerate frames and capture the tab for the vision
     // fallback when the accessibility tree isn't enough. The Groq API is
