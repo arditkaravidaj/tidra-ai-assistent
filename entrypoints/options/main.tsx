@@ -92,7 +92,11 @@ const MODES: { id: Skill['mode']; label: string; desc: string }[] = [
 ];
 
 function Options() {
-  const [tab, setTab] = useState<Tab>('general');
+  // Deep-linkable pages: options.html?tab=skills opens straight on Skills.
+  const [tab, setTab] = useState<Tab>(() => {
+    const t = new URLSearchParams(location.search).get('tab');
+    return TABS.some((x) => x.id === t) ? (t as Tab) : 'general';
+  });
   const [apiKey, setApiKey] = useState('');
   const [tier, setTier] = useState('balanced');
   const [routineOn, setRoutineOn] = useState(true);
@@ -445,6 +449,19 @@ function Options() {
     <div className="wrap">
       {/* Same background footage as the home page. */}
       <video className="opt-video" src="/bg.mp4" autoPlay muted loop playsInline aria-hidden="true" />
+      <button
+        type="button"
+        className="opt-back"
+        title="Back to home"
+        aria-label="Back to Tidra home"
+        onClick={() => {
+          location.href = browser.runtime.getURL('/newtab.html');
+        }}
+      >
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+          <path d="M19 12H5m0 0 6-6m-6 6 6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
       <div className="card">
         <div className="brand">
           <Orb />

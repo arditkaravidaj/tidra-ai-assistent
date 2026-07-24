@@ -4,6 +4,7 @@ import { streamText, tierFor } from '../../lib/llm';
 import { record, transcribe, type Recorder } from '../../lib/voice';
 import { expandSkill, filterSkills, loadSkills, matchSkill, type Skill } from '../../lib/skills';
 import { defaultTaskFor, faviconUrl, prettyDomain } from '../../lib/routine';
+import { archiveChat, reportUrl } from '../../lib/library';
 import { Wordmark } from '../../components/Wordmark';
 
 // Minimal inline markdown → JSX: **bold**, *italic*/_italic_, `code`.
@@ -33,6 +34,7 @@ const SYSTEM = `You are Tidra, a warm, sharp assistant living in the user's brow
 Answer questions directly and concisely — a few tight sentences or short bullets, no filler preamble.
 Answer from what you know.
 If answering would need the browser — opening a website, or looking at the user's own account (their inbox, messages, notifications, feed, orders, calendar) — do NOT say you can't access it. Reply with exactly NEEDS_BROWSER and nothing else, and it will be handed to the part of Tidra that can.
+If the request hangs on something only the user knows — audience, tone, goal, scope — ask ONE short clarifying question instead of guessing; never more than one.
 Reply in the language the user writes in.`;
 
 // The local chat model emits this alone when a request turns out to need the
@@ -180,6 +182,17 @@ const IconNew = () => (
   </svg>
 );
 
+// Books-on-a-shelf mark for the library chip.
+const IconLib = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
+    <path
+      d="M4 4.5h4v15H4v-15Zm6 0h4v15h-4v-15Zm7.2.6 3.4 14.1-3.9 1-3.4-14.2 3.9-.9Z"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
 const IconPlay = () => (
   <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
     <path d="M7 4.8v14.4l12-7.2L7 4.8Z" fill="currentColor" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
@@ -237,8 +250,8 @@ const IconGear = () => (
     <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
   </svg>
 );
-const IconBolt = () => (
-  <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+const IconBolt = ({ size = 18 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none">
     <path
       d="M13 2 4.5 13.5H11L9.5 22 19 10.5h-6.5L13 2Z"
       stroke="currentColor"
@@ -675,6 +688,8 @@ function NewTab() {
 
   function reset() {
     stop();
+    // Keep the finished conversation in the library rather than losing it.
+    if (turns.length) void archiveChat('newtab', turns);
     setTurns([]);
     setInput('');
     setReactions({});
@@ -1134,6 +1149,24 @@ function NewTab() {
               <button className="nt-chip" onClick={() => browser.tabs.create({})} title="Open a new tab">
                 <IconNew />
                 <span>New tab</span>
+              </button>
+              <button
+                className="nt-chip"
+                onClick={() => browser.tabs.create({ url: reportUrl() })}
+                title="Your reports and saved chats"
+              >
+                <IconLib />
+                <span>Library</span>
+              </button>
+              <button
+                className="nt-chip"
+                onClick={() =>
+                  browser.tabs.create({ url: browser.runtime.getURL('/options.html') + '?tab=skills' })
+                }
+                title="Your slash-command skills — /summarize, /fact-check, …"
+              >
+                <IconBolt size={15} />
+                <span>Skills</span>
               </button>
               <div className="nt-box-actions">
                 {micButton}

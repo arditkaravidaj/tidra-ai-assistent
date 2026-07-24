@@ -32,6 +32,7 @@ import {
 import { parsePrintedConfirm } from '../lib/confirm';
 import { expandSkill, loadSkills, matchSkill } from '../lib/skills';
 import { defaultTaskFor, prettyDomain } from '../lib/routine';
+import { reportUrl, saveReport } from '../lib/library';
 import { base64ToBlob, transcribe } from '../lib/voice';
 import { buildPdf, bytesToBase64, safeFilename, toWinAnsiText } from '../lib/pdf';
 import { extFromUrl, nameFromUrl, saveData, saveUrl } from '../lib/download';
@@ -105,8 +106,9 @@ Tools:
 - screenshot(): a picture of the page. Expensive — only when the snapshot genuinely isn't enough (canvas, custom widgets) or an action failed twice and you need to see why.
 - click_text(text) / type_text(text, field, submit): label-matching fallbacks for when a full snapshot isn't worth it.
 
-Files — you can put things on the user's disk:
-- create_pdf(title, content, subtitle, filename): writes a real PDF into their Downloads. content is markdown (# headings, - bullets, tables, **bold**), and it is the whole document, so write it in full.
+Documents — reports and files:
+- create_report(title, content, subtitle): write a styled report into Tidra's library and open it in a tab. Reach for it when the user asks for a report, a comparison, research, a plan, a briefing — anything better read as a document than a chat bubble. content is markdown (# headings, - bullets, tables, **bold**) and it IS the whole document, so write it in full. For a quick question, just answer in chat.
+- create_pdf(title, content, subtitle, filename): writes a real PDF into their Downloads. content is markdown, and it is the whole document, so write it in full. Use it when they explicitly want a file on disk; otherwise prefer create_report.
 - download_file(url, filename): saves anything that already has a URL — an image, an attachment, an export link.
 - list_images(): the page's images, biggest first, each with a ref like img_1. "Download this image" → list_images, pick the one they mean (usually the first), download_file("img_1").
 - "Make a PDF of this page" → get_page() to read it properly, THEN create_pdf with the real content — the article, the thread, the table, laid out with headings. Not three bullet points. If they ask for a PDF of something you wrote in this conversation, use what you wrote.
@@ -116,7 +118,8 @@ How to behave — be decisive and intelligent:
 - Reply in the language the user writes in.
 - "THIS" MEANS WHAT'S ON THEIR SCREEN: when the user says "this post", "reply to this", "answer this email", they are looking at it RIGHT NOW. The target is the content currently in view — in the snapshot, the elements NOT marked "offscreen". Act on that visible item directly. Never scroll around hunting for a different post, and never pick an offscreen item over a visible one that matches.
 - EXECUTE multi-step tasks yourself. "Reply to this email" → open the reply, understand the thread from the page, write a fitting reply into the body. "Write a new post about X" → open the composer, write a genuinely good post, fill it in. Don't narrate a plan and stop — do the steps.
-- Draft real, high-quality content that fits the context and the user's voice. Don't ask them what to write unless the task is truly impossible without a specific detail (then ask ONE tight question).
+- Draft real, high-quality content that fits the context and the user's voice.
+- AI cannot know everything: when the outcome hangs on something only the user knows — audience, tone, goal, scope ("write a project update for my manager") — ask ONE short, pointed question BEFORE doing the work, then finish in one go with the answer. Never more than one round of questions; when a sensible assumption is available, make it and say you did, instead of asking.
 - Don't over-ask or over-confirm. Take reasonable actions (navigating, opening composers, writing drafts, filling fields) without asking permission.
 
 THE ONE HARD RULE — confirm before the irreversible send:
@@ -246,6 +249,26 @@ const TOOLS: Tool[] = [
         submit: { type: 'boolean', description: 'Press Enter / submit after typing' },
       },
       required: ['text'],
+    },
+  },
+  {
+    name: 'create_report',
+    description:
+      "Create a styled report document in Tidra's library and open it in a new tab. Use for anything the user will want to read as a document, keep, or share: reports, comparisons, plans, research, briefings. The body is markdown: # headings, - bullets, 1. lists, **bold**, tables and ```code```. Write the WHOLE document — this content IS the report. For a quick answer reply in chat instead; use create_pdf only when they want a file on disk.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'The report title, shown large at the top.' },
+        subtitle: {
+          type: 'string',
+          description: 'Optional line under the title — the source, a date, a one-line scope.',
+        },
+        content: {
+          type: 'string',
+          description: 'The full document as markdown. Include everything that belongs in it.',
+        },
+      },
+      required: ['title', 'content'],
     },
   },
   {
@@ -474,8 +497,15 @@ async function clearLoading() {
 // Append a message to the persisted chat and clear the loading flag.
 // The island renders from storage, so this survives page navigation.
 // A short "what I'm doing right now" line for the collapsed island, so the
-// user sees progress without keeping the panel open. Cleared when the turn ends.
+// user sees progress without keeping the panel open. Cleared when the turn
+// ends. Every status also lands in a step log the island can expand — the
+// "watch Tidra think" trail.
+let stepLog: string[] = [];
 function setStatus(text: string | null) {
+  if (text) {
+    if (stepLog[stepLog.length - 1] !== text) stepLog.push(text);
+    return browser.storage.local.set({ tidraStatus: text, tidraSteps: stepLog.slice(-40) });
+  }
   return browser.storage.local.set({ tidraStatus: text });
 }
 
@@ -531,6 +561,8 @@ function statusFor(tool: string, input: any): string {
     }
     case 'get_page':
       return 'Reading the page';
+    case 'create_report':
+      return 'Writing the report';
     case 'create_pdf':
       return 'Making the PDF';
     case 'download_file':
@@ -767,6 +799,26 @@ async function execTool(
     // a download does not care which tab is in front. Both run before the
     // "is there a web page here" guard below, so they still work from the new
     // tab, where there is no content script at all.
+    if (name === 'create_report') {
+      const body = String(input?.content ?? '').trim();
+      if (!body) {
+        return { content: 'Nothing to put in the report — pass the document as `content`.', isError: true };
+      }
+      const report = await saveReport({
+        title: String(input?.title ?? '').trim() || 'Report',
+        subtitle: String(input?.subtitle ?? '').trim() || undefined,
+        markdown: body,
+        source: 'chat',
+      });
+      // The report IS the answer, so it opens in front — unlike the agent's
+      // working tabs, which stay in the background.
+      await browser.tabs.create({ url: reportUrl(report.id), active: true }).catch(() => {});
+      return {
+        content: 'Report created and opened in a new tab. It is saved in the Tidra library.',
+        isError: false,
+      };
+    }
+
     if (name === 'create_pdf') {
       const body = String(input?.content ?? '').trim();
       if (!body) {
@@ -969,6 +1021,10 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   }
   const { apiKey, tier } = setup;
 
+  // A fresh turn starts a fresh step trail.
+  stepLog = [];
+  await browser.storage.local.set({ tidraSteps: [] });
+
   // Build conversation memory from persisted chat so multi-turn flows work
   // (e.g. Tidra drafts an email, user later says "yes, send it").
   const { tidraChat } = await browser.storage.local.get('tidraChat');
@@ -1095,13 +1151,14 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   // it, and it supports tools too, so the agent loop still works.
   const actModel = images.length ? GROQ_MODELS.vision : route === 'act' ? tier.act : tier.chat;
   // The vision fallback is only offered to models that can actually see.
-  // create_pdf survives into the chat route as the one tool that needs no page:
-  // "rewrite this as a memo and give me a PDF" is a chat request right up until
-  // the moment it isn't, and the router should not be able to lose the file.
+  // create_pdf and create_report survive into the chat route as the tools that
+  // need no page: "rewrite this as a memo and give me a report" is a chat
+  // request right up until the moment it isn't, and the router should not be
+  // able to lose the document.
   const tools: any[] =
     route === 'act'
       ? TOOLS.filter((t) => t.name !== 'screenshot' || supportsVision(actModel))
-      : TOOLS.filter((t) => t.name === 'create_pdf');
+      : TOOLS.filter((t) => t.name === 'create_pdf' || t.name === 'create_report');
 
   const profileText = await profilePreamble();
   const modeNote = autoMode
@@ -1277,9 +1334,16 @@ async function runSiteAgent(
   // watching this run.
   const tools = TOOLS.filter(
     (t) =>
-      !['confirm_action', 'open_url', 'screenshot', 'go_back', 'create_pdf', 'download_file', 'list_images'].includes(
-        t.name,
-      ),
+      ![
+        'confirm_action',
+        'open_url',
+        'screenshot',
+        'go_back',
+        'create_pdf',
+        'create_report',
+        'download_file',
+        'list_images',
+      ].includes(t.name),
   );
   const snapshotIds = new Set<string>();
   let guard = 0;
@@ -1350,6 +1414,10 @@ async function runRoutine() {
       'assistant',
     );
 
+    // Each site's findings also become a section of one consolidated brief —
+    // a report the user can read, keep, and export, instead of piecing the
+    // morning together from separate chat bubbles.
+    const sections: string[] = [];
     for (const site of sites) {
       const name = prettyDomain(site.domain);
       const task = (tasks[site.domain] || defaultTaskFor(site.domain)).trim();
@@ -1362,12 +1430,32 @@ async function runRoutine() {
         await waitForTabLoad(tab.id);
         await sleep(700);
         const report = await runSiteAgent(apiKey, tier.act, task, tab.id, profileText);
+        sections.push(`## ${name}\n\n${report}`);
         await pushChat(`**${name}**\n${report}`, 'assistant');
       } catch (err) {
         await pushChat(`**${name}** — ${err instanceof Error ? err.message : String(err)}`, 'error');
       }
     }
-    await pushChat('✅ Routine finished. Review the drafts in the tabs I opened before sending anything.', 'assistant');
+    if (sections.length) {
+      const when = new Date().toLocaleDateString(undefined, {
+        weekday: 'long',
+        month: 'long',
+        day: 'numeric',
+      });
+      const brief = await saveReport({
+        title: 'Your routine brief',
+        subtitle: when,
+        markdown: sections.join('\n\n'),
+        source: 'routine',
+      });
+      await browser.tabs.create({ url: reportUrl(brief.id), active: false }).catch(() => {});
+      await pushChat(
+        '✅ Routine finished — everything is in one brief, opened in a tab (it also lives in the library). Review the drafts in the site tabs before sending anything.',
+        'assistant',
+      );
+    } else {
+      await pushChat('✅ Routine finished. Review the drafts in the tabs I opened before sending anything.', 'assistant');
+    }
   } finally {
     routineRunning = false;
   }
@@ -1653,6 +1741,7 @@ async function runJobItem(
   const tools = [
     ...TOOLS.filter((t) => {
       if (t.name === 'screenshot') return false; // a background tab cannot be captured
+      if (t.name === 'create_report') return false; // 1000 items must not open 1000 tabs
       if (t.name === 'confirm_action') return sampling;
       return true;
     }),

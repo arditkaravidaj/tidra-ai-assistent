@@ -79,6 +79,14 @@ export const DEFAULT_SKILLS: Skill[] = [
     mode: 'act',
   },
   {
+    id: 'waiting-on',
+    name: 'waiting-on',
+    description: 'Who is still waiting on a reply from you',
+    prompt:
+      "Work out who is still waiting on me. Open https://mail.google.com and scan the recent inbox for emails that clearly expect a reply I haven't sent, then open https://www.linkedin.com/messaging/ and check for unanswered messages. Compile ONE prioritized list — who, on which site, what they need, and how urgent it feels. If the list is more than a few items, present it with create_report; otherwise answer in chat. Do not draft or send anything — just tell me where the ball is in my court. {input}",
+    mode: 'act',
+  },
+  {
     id: 'weekly',
     name: 'weekly',
     description: 'A light recap of your browsing week',

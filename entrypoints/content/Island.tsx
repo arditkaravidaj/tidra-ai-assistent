@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Wordmark } from '../../components/Wordmark';
 import { blobToBase64, record, type Recorder } from '../../lib/voice';
 import { filterSkills, loadSkills, type Skill } from '../../lib/skills';
+import { archiveChat } from '../../lib/library';
 
 // Minimal inline markdown → JSX: **bold**, *italic*/_italic_, `code`.
 // Newlines are preserved by CSS (white-space: pre-wrap); emoji pass through.
@@ -249,6 +250,8 @@ export function Island() {
   const [closing, setClosing] = useState(false);
   const [entered, setEntered] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  // The step trail behind the one-line status — expandable "watch Tidra work".
+  const [steps, setSteps] = useState<string[]>([]);
   // Manual (default): stop and ask before anything irreversible.
   // Auto: the user has approved those in advance — just do it.
   const [auto, setAuto] = useState(false);
@@ -456,11 +459,13 @@ export function Island() {
         'tidraPanelSize',
         'tidraUnread',
         'tidraStatus',
+        'tidraSteps',
         'tidraAuto',
         'tidraJob',
       ])
-      .then(({ tidraOpen, tidraChat, tidraPending, tidraIslandPos, tidraPanelPos, tidraPanelSize, tidraUnread, tidraStatus, tidraAuto, tidraJob }) => {
+      .then(({ tidraOpen, tidraChat, tidraPending, tidraIslandPos, tidraPanelPos, tidraPanelSize, tidraUnread, tidraStatus, tidraSteps, tidraAuto, tidraJob }) => {
         if (typeof tidraStatus === 'string') setStatus(tidraStatus);
+        if (Array.isArray(tidraSteps)) setSteps(tidraSteps as string[]);
         setAuto(tidraAuto === true);
         if (tidraJob) setJob(tidraJob as JobView);
         if (tidraOpen) setOpen(true);
@@ -476,6 +481,7 @@ export function Island() {
       if (area !== 'local') return;
       if (changes.tidraChat) setChat((changes.tidraChat.newValue as ChatState) ?? EMPTY);
       if (changes.tidraStatus) setStatus((changes.tidraStatus.newValue as string) ?? null);
+      if (changes.tidraSteps) setSteps((changes.tidraSteps.newValue as string[]) ?? []);
       if (changes.tidraAuto) setAuto(changes.tidraAuto.newValue === true);
       if (changes.tidraOpen) setOpen(!!changes.tidraOpen.newValue);
       if (changes.tidraPending) setPending((changes.tidraPending.newValue as Pending) ?? null);
@@ -823,6 +829,8 @@ export function Island() {
   }
 
   function clearChat() {
+    // The old conversation is kept in the library, never silently destroyed.
+    if (chat.messages.length) void archiveChat('island', chat.messages);
     const empty = { ...EMPTY };
     setChat(empty);
     setPending(null);
@@ -1284,6 +1292,18 @@ export function Island() {
             <span />
             <span />
           </div>
+        )}
+        {chat.loading && steps.length > 0 && (
+          <details className="tidra-steps">
+            <summary>
+              {status || 'Working'} · {steps.length} step{steps.length === 1 ? '' : 's'}
+            </summary>
+            <ol>
+              {steps.map((s, i) => (
+                <li key={i}>{s}</li>
+              ))}
+            </ol>
+          </details>
         )}
         {showSettingsLink && (
           <button className="tidra-settings-link" onClick={() => openSettings()}>

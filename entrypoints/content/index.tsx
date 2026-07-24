@@ -31,8 +31,21 @@ export default defineContentScript({
       position: 'inline',
       anchor: 'body',
       onMount: (container) => {
-        const root = ReactDOM.createRoot(container);
+        // The island must sit above every site overlay (LinkedIn's post viewer,
+        // lightboxes, cookie walls). z-index tops out at 2147483647 and ties
+        // break by DOM order — which the page controls. The browser's top
+        // layer beats ANY z-index, so the UI renders inside a manual popover.
+        const layer = document.createElement('div');
+        layer.className = 'tidra-layer';
+        container.appendChild(layer);
+        const root = ReactDOM.createRoot(layer);
         root.render(<Island />);
+        try {
+          layer.popover = 'manual';
+          layer.showPopover();
+        } catch {
+          layer.removeAttribute('popover'); // older browser — normal stacking still applies
+        }
         return root;
       },
       onRemove: (root) => {

@@ -216,24 +216,38 @@ export async function callModel(
   params: CallParams,
   signal?: AbortSignal,
 ): Promise<ModelResponse> {
-  const res = await fetch(GROQ_URL, {
-    method: 'POST',
-    signal,
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model: params.model,
-      max_tokens: params.max_tokens,
-      messages: toOpenAiMessages(params),
-      tools: toOpenAiTools(params.tools),
-      ...(params.tools?.length ? { tool_choice: 'auto' } : {}),
-    }),
-  });
+  // Two failure modes are worth retrying rather than surfacing:
+  // - GPT-OSS occasionally mis-emits its internal "commentary" channel as a
+  //   tool call ('attempted to call tool commentary which was not in
+  //   request.tools'). Groq rejects the whole generation with a 400
+  //   tool_use_failed. It is a sampling glitch — regenerating fixes it.
+  // - Transient 429/5xx from the API.
+  let lastErr: Error = new Error('Groq: no response');
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(GROQ_URL, {
+      method: 'POST',
+      signal,
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: params.model,
+        max_tokens: params.max_tokens,
+        messages: toOpenAiMessages(params),
+        tools: toOpenAiTools(params.tools),
+        ...(params.tools?.length ? { tool_choice: 'auto' } : {}),
+      }),
+    });
 
-  if (!res.ok) {
+    if (res.ok) return fromOpenAi(await res.json());
+
     const body = await res.text().catch(() => '');
-    throw new Error(`Groq ${res.status}: ${body.slice(0, 400)}`);
+    lastErr = new Error(`Groq ${res.status}: ${body.slice(0, 400)}`);
+    const badToolCall =
+      res.status === 400 && /tool_use_failed|tool call validation failed/i.test(body);
+    const transient = res.status === 429 || res.status >= 500;
+    if ((!badToolCall && !transient) || signal?.aborted) throw lastErr;
+    if (transient) await new Promise((r) => setTimeout(r, 700 * (attempt + 1)));
   }
-  return fromOpenAi(await res.json());
+  throw lastErr;
 }
 
 /* ── Streaming, for the new tab's inline answers ──────────────────────────── */
