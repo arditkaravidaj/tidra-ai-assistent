@@ -45,6 +45,34 @@ export async function transcribe(apiKey: string, clip: Blob, signal?: AbortSigna
   return (await res.text()).trim();
 }
 
+/* ── Getting a clip to somewhere allowed to send it ───────────────────────── */
+
+/**
+ * A content script cannot do this fetch itself.
+ *
+ * Under MV3 a content script has no cross-origin privileges — the request is
+ * made in the page's security context, where the site's own CSP applies, and
+ * LinkedIn is never going to allow a POST to api.groq.com. So a clip recorded
+ * inside a page has to be handed to the background worker, which does hold the
+ * host permissions. Extension messages are JSON only, hence base64.
+ */
+export function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Could not read the recording.'));
+    reader.onload = () => resolve(String(reader.result).split(',')[1] ?? '');
+    reader.readAsDataURL(blob);
+  });
+}
+
+/** The other half of the handoff, run in the background. */
+export function base64ToBlob(b64: string, mime: string): Blob {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
 /** What a clip of this length cost, for the settings screen. */
 export function clipCost(ms: number): number {
   const billedSeconds = Math.max(10, ms / 1000); // Groq bills a 10s minimum
@@ -169,6 +197,11 @@ function listenForSilence(
   onEnd: (reason: StopReason) => void,
 ): () => void {
   const ctx = new AudioContext();
+  // A context created where no user gesture has ever happened starts suspended,
+  // and a suspended context never delivers an audio callback — the silence
+  // detector would sit there deaf while the recording ran to its cap. Asking to
+  // resume costs nothing when it was already running.
+  void ctx.resume().catch(() => {});
   const source = ctx.createMediaStreamSource(stream);
   const node = ctx.createScriptProcessor(2048, 1, 1);
 

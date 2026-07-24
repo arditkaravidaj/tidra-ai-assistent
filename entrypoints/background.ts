@@ -30,6 +30,7 @@ import {
   type JobItem,
 } from '../lib/jobs';
 import { parsePrintedConfirm } from '../lib/confirm';
+import { base64ToBlob, transcribe } from '../lib/voice';
 
 interface PageContext {
   title: string;
@@ -1817,15 +1818,17 @@ async function ensureOffscreen(): Promise<void> {
 }
 
 /**
- * Which island asked to listen. The mic can close itself mid-sentence, long
- * after the "start" call returned, so the result has to find its way back to
- * the right island — and only that one. Islands on other tabs must not
- * suddenly sprout someone else's words.
+ * Which island asked to listen, kept IN STORAGE rather than in a variable.
+ *
+ * This looks like over-engineering and isn't. Between "start listening" and the
+ * words coming back, this worker has nothing to do — and a worker with nothing
+ * to do is killed within ~30 seconds. It then restarts to handle the result
+ * with every variable reset, so an in-memory id would be null exactly when it
+ * was needed, the island would reject its own transcript as belonging to
+ * someone else, and the mic would never reset. Storage outlives the worker.
  */
-let voiceSid: string | null = null;
-
 async function voiceRelay(action: string, sid?: string): Promise<any> {
-  if (action === 'start') voiceSid = sid ?? null;
+  if (action === 'start') await browser.storage.local.set({ tidraVoiceSid: sid ?? null });
   await ensureOffscreen();
   // createDocument resolves once the document exists, which is not the same as
   // its module script having run and registered a listener. A message that
@@ -1846,14 +1849,14 @@ async function voiceRelay(action: string, sid?: string): Promise<any> {
 
 /** Offscreen finished (or gave up). Publish it for the island that asked. */
 async function publishVoice(msg: { state?: string; text?: string; error?: string }): Promise<void> {
-  const sid = voiceSid;
+  const { tidraVoiceSid } = await browser.storage.local.get('tidraVoiceSid');
+  const sid = (tidraVoiceSid as string | null) ?? null;
   await browser.storage.local.set({
     tidraVoice: { sid, state: msg.state ?? 'idle', error: msg.error },
     // Only stamp heard text when there is some — an empty result should leave
     // the last thing the user said alone.
     ...(msg.text ? { tidraHeard: { sid, text: msg.text, ts: Date.now() } } : {}),
   });
-  if (msg.state === 'idle') voiceSid = null;
 }
 
 export default defineBackground(() => {
@@ -1908,6 +1911,22 @@ export default defineBackground(() => {
     if (message?.type === 'tidra-voice-result') {
       publishVoice(message).catch(() => {});
       return;
+    }
+    // Transcribe a clip recorded inside a page. The content script can't call
+    // Groq itself — no cross-origin privileges under MV3, and the site's CSP
+    // governs the request — so the audio comes here instead.
+    if (message?.type === 'tidra-transcribe' && typeof message.audio === 'string') {
+      (async () => {
+        const { tidraGroqKey } = await browser.storage.local.get('tidraGroqKey');
+        if (!tidraGroqKey) return sendResponse({ ok: false, error: 'no-key' });
+        try {
+          const clip = base64ToBlob(message.audio, message.mime || 'audio/webm');
+          sendResponse({ ok: true, text: await transcribe(tidraGroqKey as string, clip) });
+        } catch (err) {
+          sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
+        }
+      })();
+      return true; // async response
     }
     // Batch job controls from the island: start / approve / pause / resume /
     // cancel / dismiss.

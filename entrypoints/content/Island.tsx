@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Wordmark } from '../../components/Wordmark';
+import { blobToBase64, record, type Recorder } from '../../lib/voice';
 
 // Minimal inline markdown → JSX: **bold**, *italic*/_italic_, `code`.
 // Newlines are preserved by CSS (white-space: pre-wrap); emoji pass through.
@@ -260,6 +261,8 @@ export function Island() {
   const [micNote, setMicNote] = useState<{ text: string; fixable?: boolean } | null>(null);
   /** Identifies this island's listening session — see toggleMic. */
   const voiceSid = useRef<string | null>(null);
+  /** Set only when falling back to recording in this page — see startLocalMic. */
+  const localRec = useRef<Recorder | null>(null);
   // Heard speech arrives through a storage listener registered once, so it
   // would otherwise be stuck with the very first render's state. This keeps the
   // send path pointed at the present.
@@ -614,6 +617,27 @@ export function Island() {
     liveRef.current = { input, ask };
   });
 
+  // Navigating away must never leave the page's recording light on.
+  useEffect(() => () => localRec.current?.cancel(), []);
+
+  // Last resort: the mic must always come back. Every step between pressing it
+  // and the words arriving happens in another context — an offscreen page, a
+  // service worker that may be killed mid-sentence — and any of them can go
+  // quiet. A button stuck mid-state is unusable, and 'thinking' ignores clicks,
+  // so nothing would ever free it again.
+  useEffect(() => {
+    if (mic === 'off') return;
+    const limit = mic === 'listening' ? 75_000 : 30_000; // clip cap + slack, or a transcription
+    const id = setTimeout(() => {
+      setMic('off');
+      voiceSid.current = null;
+      localRec.current?.cancel();
+      localRec.current = null;
+      setMicNote({ text: 'The microphone stopped responding. Press it to try again.' });
+    }, limit);
+    return () => clearTimeout(id);
+  }, [mic]);
+
   function confirmSend() {
     const label = pending?.label ?? 'Send';
     setPending(null);
@@ -655,23 +679,102 @@ export function Island() {
   // Talking to Tidra instead of typing. Click to listen, click again to send
   // it to Whisper — the words land in the input so they can be edited before
   // they go, rather than firing off a misheard sentence.
+  /**
+   * Fallback microphone, recorded by the page itself.
+   *
+   * The offscreen document is the better route — one grant, every site. But if
+   * it can't record (a browser that withholds the extension-origin grant from
+   * an invisible document, say), the choice is between asking THIS site for the
+   * microphone and having the button silently do nothing. A prompt the user can
+   * answer wins every time, even though it has to be answered per site.
+   */
+  async function startLocalMic(): Promise<boolean> {
+    try {
+      localRec.current = await record({
+        onDone: (clip) => {
+          localRec.current = null;
+          void useLocalClip(clip);
+        },
+      });
+      setMic('listening');
+      return true;
+    } catch (err) {
+      const name = (err as { name?: string })?.name;
+      setMicNote({
+        text:
+          name === 'NotAllowedError'
+            ? `Allow the microphone for ${location.hostname} in the address bar, then press the mic again.`
+            : name === 'NotFoundError'
+              ? 'No microphone found.'
+              : 'Could not start the microphone here.',
+      });
+      return false;
+    }
+  }
+
+  async function useLocalClip(clip: Blob | null) {
+    setMic('thinking');
+    try {
+      if (!clip || clip.size < 1200) return; // a click, not a sentence
+      // Handed to the background, which is the only context allowed to reach
+      // Groq from here — see blobToBase64 in lib/voice.ts.
+      const res = await browser.runtime
+        .sendMessage({ type: 'tidra-transcribe', audio: await blobToBase64(clip), mime: clip.type })
+        .catch((err) => ({ ok: false, error: String(err) }));
+      if (!res?.ok) {
+        setMicNote(micError(res?.error));
+        return;
+      }
+      const heard = String(res.text ?? '').trim();
+      if (!heard) return;
+      const typed = liveRef.current.input.trim();
+      setInput('');
+      liveRef.current.ask(typed ? `${typed} ${heard}` : heard);
+    } catch (err) {
+      setMicNote({ text: err instanceof Error ? err.message : 'Could not transcribe that.' });
+    } finally {
+      setMic('off');
+    }
+  }
+
   async function toggleMic() {
     if (mic === 'thinking') return;
     setMicNote(null);
 
+    // A local recording in progress owns the mic — stop that one.
+    if (localRec.current) {
+      const rec = localRec.current;
+      localRec.current = null;
+      await useLocalClip(await rec.stop());
+      return;
+    }
+
     if (mic === 'off') {
-      // A fresh id each time: the mic closes itself when you stop talking, and
-      // the words must come back to THIS island, not to one on another tab.
+      // Record in THIS page first.
+      //
+      // The shared offscreen recorder is the tidier idea — one permission for
+      // every site — but it is an invisible document, and that turns out to
+      // matter: no user gesture ever happens there, so its audio context can
+      // start suspended and the end-of-speech detector goes deaf; its timers
+      // are throttled; and when it fails it fails silently. Recording here
+      // instead runs in exactly the environment the new tab already proves
+      // works — visible, gestured, unthrottled. The cost is a permission
+      // prompt per site, which is a thing the user can see and answer.
+      if (await startLocalMic()) return;
+
+      // This page refused (or has no microphone). Fall back to the shared
+      // recorder, which at least has its own permission to draw on.
       const sid = Math.random().toString(36).slice(2);
       voiceSid.current = sid;
-      setMic('listening');
       const res = await browser.runtime
         .sendMessage({ type: 'tidra-voice', action: 'start', sid })
         .catch(() => null);
-      if (!res?.ok) {
-        setMic('off');
+      if (res?.ok) {
+        setMic('listening');
+        setMicNote(null);
+      } else {
         voiceSid.current = null;
-        setMicNote(micError(res?.error));
+        setMic('off');
       }
       return;
     }
@@ -679,7 +782,13 @@ export function Island() {
     // Cutting it short by hand. The result still arrives via storage, same as
     // if the pause had ended it — one path, not two.
     setMic('thinking');
-    browser.runtime.sendMessage({ type: 'tidra-voice', action: 'stop' }).catch(() => {});
+    const res = await browser.runtime.sendMessage({ type: 'tidra-voice', action: 'stop' }).catch(() => null);
+    // Nothing was recording after all. Without this the button would sit in
+    // 'thinking' forever, and 'thinking' ignores clicks — a dead mic.
+    if (!res?.ok) {
+      setMic('off');
+      voiceSid.current = null;
+    }
   }
 
   function micError(code?: string): { text: string; fixable?: boolean } {
