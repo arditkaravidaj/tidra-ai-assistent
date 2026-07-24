@@ -28,6 +28,10 @@ export default defineConfig({
       // Voice input records in an offscreen document, because a content script
       // would have to borrow the host page's microphone permission.
       'offscreen',
+      // Saving a generated PDF or an image off a page. A service worker has no
+      // DOM, so an <a download> is not available to it — this API is the only
+      // way the background can put a file on disk.
+      'downloads',
     ],
     // <all_urls> is what the content script already matches; it additionally
     // lets the background enumerate frames and capture the tab for the vision

@@ -31,6 +31,8 @@ import {
 } from '../lib/jobs';
 import { parsePrintedConfirm } from '../lib/confirm';
 import { base64ToBlob, transcribe } from '../lib/voice';
+import { buildPdf, bytesToBase64, safeFilename, toWinAnsiText } from '../lib/pdf';
+import { extFromUrl, nameFromUrl, saveData, saveUrl } from '../lib/download';
 
 interface PageContext {
   title: string;
@@ -100,6 +102,13 @@ Tools:
 - get_page(): the page's visible TEXT — for reading and understanding content (an email thread, an article), not for finding things to click.
 - screenshot(): a picture of the page. Expensive — only when the snapshot genuinely isn't enough (canvas, custom widgets) or an action failed twice and you need to see why.
 - click_text(text) / type_text(text, field, submit): label-matching fallbacks for when a full snapshot isn't worth it.
+
+Files — you can put things on the user's disk:
+- create_pdf(title, content, subtitle, filename): writes a real PDF into their Downloads. content is markdown (# headings, - bullets, tables, **bold**), and it is the whole document, so write it in full.
+- download_file(url, filename): saves anything that already has a URL — an image, an attachment, an export link.
+- list_images(): the page's images, biggest first, each with a ref like img_1. "Download this image" → list_images, pick the one they mean (usually the first), download_file("img_1").
+- "Make a PDF of this page" → get_page() to read it properly, THEN create_pdf with the real content — the article, the thread, the table, laid out with headings. Not three bullet points. If they ask for a PDF of something you wrote in this conversation, use what you wrote.
+- Saving a file is not irreversible: just do it, then say where it went. No confirm_action.
 
 How to behave — be decisive and intelligent:
 - Reply in the language the user writes in.
@@ -235,6 +244,50 @@ const TOOLS: Tool[] = [
       },
       required: ['text'],
     },
+  },
+  {
+    name: 'create_pdf',
+    description:
+      "Write a PDF and save it to the user's Downloads. Use it whenever they ask for a PDF — of the page, of an article or email you have read, or of something you have written. Read the source first (get_page) so the PDF holds the real content, never a summary of a summary. The body is markdown: # headings, - bullets, 1. lists, **bold**, tables and ```code```.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Shown large at the top of page one.' },
+        subtitle: {
+          type: 'string',
+          description: 'Optional line under the title — the source URL, a date, a byline.',
+        },
+        content: {
+          type: 'string',
+          description:
+            'The full body as markdown. Include everything that belongs in the document — this text IS the PDF.',
+        },
+        filename: { type: 'string', description: 'File name without the extension. Defaults to the title.' },
+      },
+      required: ['content'],
+    },
+  },
+  {
+    name: 'download_file',
+    description:
+      "Save a file that already exists at a URL to the user's Downloads — an image, a PDF, an attachment, an export link. For an image on the current page, call list_images first and pass the src it gives you; do not guess a URL.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'Direct URL of the file (an image src, a link href).' },
+        filename: {
+          type: 'string',
+          description: 'File name to save it as, with extension. Optional — the URL supplies one.',
+        },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'list_images',
+    description:
+      'List the images on the page — src, alt text and displayed size, biggest and most visible first. Use this to find the right image before download_file. "This image" is usually the first entry.',
+    input_schema: { type: 'object', properties: {} },
   },
   {
     name: 'confirm_action',
@@ -498,6 +551,12 @@ function statusFor(tool: string, input: any): string {
     }
     case 'get_page':
       return 'Reading the page';
+    case 'create_pdf':
+      return 'Making the PDF';
+    case 'download_file':
+      return 'Downloading';
+    case 'list_images':
+      return 'Looking at the images';
     case 'list_actions':
       return 'Looking at what\'s on the page';
     case 'click_text':
@@ -542,7 +601,7 @@ async function classify(
         [
           'Reply with exactly one word: act or chat.',
           '',
-          'act — answering needs the browser. That covers doing things (open, go, search, click, type, reply, post, fill, buy) AND looking things up that only exist behind a website or the user\'s own account: their inbox, messages, notifications, orders, calendar, profile, feed, or anything current on a specific site.',
+          'act — answering needs the browser. That covers doing things (open, go, search, click, type, reply, post, fill, buy, download a file, save something as a PDF) AND looking things up that only exist behind a website or the user\'s own account: their inbox, messages, notifications, orders, calendar, profile, feed, or anything current on a specific site.',
           '',
           'chat — can be answered from general knowledge alone, or is about text already in this conversation.',
           '',
@@ -551,6 +610,9 @@ async function classify(
           '"what did Marco reply?" -> act',
           '"any new emails?" -> act',
           '"summarise this page" -> act',
+          '"make a pdf of this page" -> act',
+          '"download this image" -> act',
+          '"save that as a pdf" -> act',
           '"what is the capital of Albania?" -> chat',
           '"rewrite that paragraph more formally" -> chat',
           '',
@@ -611,6 +673,25 @@ async function sendAction(
   }
   throw new Error('Page not reachable (content script not ready).');
 }
+
+/** A bound sender for one tab, for the parts of a download only the page can do. */
+function pageCaller(tabId: number | undefined) {
+  if (tabId == null) return undefined;
+  return (payload: Record<string, unknown>) => sendAction(tabId, { type: 'tidra-action', ...payload }, 3);
+}
+
+// The last image listing per tab, so the model can say "img_2" instead of
+// echoing back a URL — which for an inline data: image would be a megabyte of
+// base64 through the context window, and for a signed CDN URL is a fine way to
+// mistype one character and download nothing.
+interface FoundImage {
+  src: string;
+  alt: string;
+  w: number;
+  h: number;
+  visible: boolean;
+}
+const lastImages = new Map<number, FoundImage[]>();
 
 // Refs are per-frame, so the model sees them namespaced: "ref_0-12" is ref_12
 // in the top frame, "ref_7-3" is ref_3 inside frame 7. Splitting here keeps the
@@ -682,6 +763,81 @@ async function execTool(
     };
   }
   try {
+    // Files are made here, not on the page: a generated PDF has no origin, and
+    // a download does not care which tab is in front. Both run before the
+    // "is there a web page here" guard below, so they still work from the new
+    // tab, where there is no content script at all.
+    if (name === 'create_pdf') {
+      const body = String(input?.content ?? '').trim();
+      if (!body) {
+        return { content: 'Nothing to put in the PDF — pass the document text as `content`.', isError: true };
+      }
+      const title = String(input?.title ?? '').trim();
+      const filename = safeFilename(input?.filename || title, 'document', 'pdf');
+      const bytes = buildPdf({
+        title,
+        subtitle: String(input?.subtitle ?? '').trim(),
+        content: body,
+      });
+      const result = await saveData(
+        `data:application/pdf;base64,${bytesToBase64(bytes)}`,
+        filename,
+        pageCaller(tabState.tabId),
+      );
+      if (!result.ok) return { content: `Could not save the PDF — ${result.error}`, isError: true };
+      // The built-in PDF fonts cover Latin only. Chinese, Arabic, Greek and
+      // emoji have no glyph and are dropped in layout — which would otherwise
+      // hand the user a half-empty document with no explanation.
+      const solid = (s: string) => s.replace(/\s/g, '').length;
+      const kept = solid(toWinAnsiText(body));
+      const dropped = solid(body) - kept;
+      const note =
+        dropped > solid(body) * 0.25
+          ? ` Note: about ${Math.round((dropped / Math.max(1, solid(body))) * 100)}% of the characters are in a script this PDF's fonts can't draw (non-Latin text or emoji) and were left out — say so plainly to the user.`
+          : '';
+      return {
+        content: `Saved "${result.filename ?? filename}" to the Downloads folder (${Math.max(1, Math.round(bytes.length / 1024))} KB).${note}`,
+        isError: false,
+      };
+    }
+
+    if (name === 'download_file') {
+      const raw = String(input?.url ?? '').trim();
+      if (!raw) return { content: 'No URL to download.', isError: true };
+      let url = raw;
+
+      const ref = /^img_(\d+)$/i.exec(raw);
+      if (ref) {
+        const found = tabState.tabId != null ? lastImages.get(tabState.tabId) : undefined;
+        const image = found?.[Number(ref[1]) - 1];
+        if (!image) {
+          return { content: `I don't have ${raw} any more — call list_images again.`, isError: true };
+        }
+        url = image.src;
+      }
+
+      if (!/^(https?|data|blob):/i.test(url)) {
+        if (/^\/\//.test(url)) url = 'https:' + url;
+        else if (/^[\w.-]+\.[a-z]{2,}\//i.test(url)) url = 'https://' + url;
+        else return { content: `"${raw.slice(0, 80)}" is not a downloadable URL.`, isError: true };
+      }
+      // An inline image carries its type in the URL itself; a normal URL usually
+      // carries it in the path. When neither does, the name is left bare and the
+      // browser names it from the response's content type.
+      const inline = /^data:([\w.+-]+)\/([\w.+-]+)/i.exec(url);
+      const ext = inline
+        ? inline[2].toLowerCase().replace('jpeg', 'jpg').replace('svg+xml', 'svg')
+        : extFromUrl(url, '');
+      const filename = safeFilename(
+        input?.filename || nameFromUrl(url, inline ? 'image' : 'download'),
+        inline ? 'image' : 'download',
+        ext,
+      );
+      const result = await saveUrl(url, filename, pageCaller(tabState.tabId));
+      if (!result.ok) return { content: `Could not download that — ${result.error}.`, isError: true };
+      return { content: `Saved "${result.filename ?? filename}" to the Downloads folder.`, isError: false };
+    }
+
     if (name === 'open_url') {
       let url: string = String(input.url || '');
       if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
@@ -717,6 +873,30 @@ async function execTool(
       const page = res?.data as PageContext;
       return { content: `Title: ${page?.title}\nURL: ${page?.url}\n\n${(page?.text || '').slice(0, 6000)}`, isError: false };
     }
+    if (name === 'list_images') {
+      const res = await sendAction(tabState.tabId, { type: 'tidra-action', action: 'list_images' });
+      const images = (res?.data as FoundImage[]) ?? [];
+      if (!images.length) {
+        return { content: 'No real images on this page — nothing bigger than an icon.', isError: false };
+      }
+      // Bounded: one listing per tab, and only the last few tabs.
+      if (lastImages.size >= 8) lastImages.delete(lastImages.keys().next().value!);
+      lastImages.set(tabState.tabId, images);
+      const lines = images.map((im, i) => {
+        // An inline image's src IS the file. Never put it in the transcript.
+        const where = im.src.startsWith('data:')
+          ? `(inline image, ${Math.round(im.src.length / 1400)} KB — use the ref)`
+          : im.src.length > 300
+            ? '(long URL — use the ref)'
+            : im.src;
+        return `img_${i + 1}: ${im.w}x${im.h}${im.visible ? '' : ' offscreen'} — ${im.alt || 'no alt text'}\n  ${where}`;
+      });
+      return {
+        content: `Images on the page, biggest and most visible first. Pass a ref like "img_1" to download_file.\n\n${lines.join('\n')}`,
+        isError: false,
+      };
+    }
+
     if (name === 'go_back') {
       await browser.tabs.goBack(tabState.tabId);
       await waitForTabLoad(tabState.tabId);
@@ -888,7 +1068,13 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   // it, and it supports tools too, so the agent loop still works.
   const actModel = images.length ? GROQ_MODELS.vision : route === 'act' ? tier.act : tier.chat;
   // The vision fallback is only offered to models that can actually see.
-  const tools: any[] = route === 'act' ? TOOLS.filter((t) => t.name !== 'screenshot' || supportsVision(actModel)) : [];
+  // create_pdf survives into the chat route as the one tool that needs no page:
+  // "rewrite this as a memo and give me a PDF" is a chat request right up until
+  // the moment it isn't, and the router should not be able to lose the file.
+  const tools: any[] =
+    route === 'act'
+      ? TOOLS.filter((t) => t.name !== 'screenshot' || supportsVision(actModel))
+      : TOOLS.filter((t) => t.name === 'create_pdf');
 
   const profileText = await profilePreamble();
   const modeNote = autoMode
@@ -1074,8 +1260,13 @@ async function runSiteAgent(
   ];
   // No confirm_action / open_url — routine tasks stay on the opened tab and never
   // send. Screenshots need vision, and a background tab can't be captured anyway.
+  // Nor do routines write files: nobody asked for a PDF, and the user is not
+  // watching this run.
   const tools = TOOLS.filter(
-    (t) => !['confirm_action', 'open_url', 'screenshot', 'go_back'].includes(t.name),
+    (t) =>
+      !['confirm_action', 'open_url', 'screenshot', 'go_back', 'create_pdf', 'download_file', 'list_images'].includes(
+        t.name,
+      ),
   );
   const snapshotIds = new Set<string>();
   let guard = 0;

@@ -479,6 +479,120 @@ function findInput(hint?: string): HTMLElement | null {
   })[0];
 }
 
+/* ── Media ────────────────────────────────────────────────────────────────── */
+
+// "Download this image" has to resolve to ONE image, and the snapshot tree only
+// carries what is clickable — an <img> usually isn't. So images get their own
+// listing, ordered by how much of the page they occupy, because the picture the
+// user means is nearly always the big one they are looking at.
+
+interface FoundImage {
+  src: string;
+  alt: string;
+  w: number;
+  h: number;
+  visible: boolean;
+}
+
+function collectImages(): FoundImage[] {
+  const out: FoundImage[] = [];
+  const seen = new Set<string>();
+
+  const add = (rawSrc: string, alt: string, el: Element) => {
+    if (!rawSrc) return;
+    let src = rawSrc;
+    try {
+      src = new URL(rawSrc, location.href).href;
+    } catch {
+      return;
+    }
+    if (seen.has(src)) return;
+    const r = el.getBoundingClientRect();
+    // Tracking pixels, spacers and icon sprites are noise in this list.
+    if (r.width < 32 || r.height < 32) return;
+    seen.add(src);
+    out.push({
+      src,
+      alt: (alt || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+      w: Math.round(r.width),
+      h: Math.round(r.height),
+      visible: inViewport(el),
+    });
+  };
+
+  for (const img of Array.from(document.images)) {
+    if (pruned(img) || !renderable(img)) continue;
+    // currentSrc is what the browser actually picked out of a srcset.
+    add(img.currentSrc || img.src, img.alt || img.title, img);
+  }
+  for (const el of Array.from(document.querySelectorAll<HTMLElement>('[style*="background-image"], picture, video[poster]'))) {
+    if (pruned(el) || !renderable(el)) continue;
+    if (el.tagName === 'VIDEO') {
+      add((el as HTMLVideoElement).poster, accName(el), el);
+      continue;
+    }
+    const bg = /url\(["']?([^"')]+)["']?\)/.exec(getComputedStyle(el).backgroundImage || '');
+    if (bg) add(bg[1], accName(el), el);
+  }
+
+  // Biggest first, on-screen ahead of off-screen: the top entry is almost
+  // always the one a person would point at.
+  return out
+    .sort((a, b) => Number(b.visible) - Number(a.visible) || b.w * b.h - a.w * a.h)
+    .slice(0, 30);
+}
+
+const MAX_ASSET_BYTES = 25 * 1024 * 1024;
+
+/**
+ * Read a URL from inside the page and hand it back as a data: URL.
+ *
+ * The background can fetch most things itself. What it cannot fetch is anything
+ * that only exists in this document — a blob: URL minted by the page, a canvas,
+ * an image the site serves only to a request carrying its own headers. Those
+ * have to be read here, where the page's origin applies.
+ */
+async function fetchAsset(url: string): Promise<{ dataUrl: string; mime: string; size: number }> {
+  const abs = new URL(url, location.href).href;
+  const res = await fetch(abs, { credentials: 'include' });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const blob = await res.blob();
+  if (blob.size > MAX_ASSET_BYTES) throw new Error(`File is too big (${Math.round(blob.size / 1e6)} MB).`);
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(new Error('Could not read the file.'));
+    reader.readAsDataURL(blob);
+  });
+  return { dataUrl, mime: blob.type || 'application/octet-stream', size: blob.size };
+}
+
+function dataUrlToBlob(dataUrl: string): Blob {
+  const [head, body] = dataUrl.split(',', 2);
+  const mime = /data:([^;,]+)/.exec(head)?.[1] || 'application/octet-stream';
+  if (!/;base64/i.test(head)) return new Blob([decodeURIComponent(body)], { type: mime });
+  const bin = atob(body);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+/** Last-resort save: an <a download> click, the way a page saves its own files. */
+function anchorSave(dataUrl: string, filename: string) {
+  const url = URL.createObjectURL(dataUrlToBlob(dataUrl));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.rel = 'noopener';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    a.remove();
+    URL.revokeObjectURL(url);
+  }, 20000);
+}
+
 /* ── Message handling ─────────────────────────────────────────────────────── */
 
 type Reply = { ok: true; data: any } | { ok: false; error: string };
@@ -581,6 +695,20 @@ async function handle(msg: any): Promise<Reply> {
       const where = accName(el) || el.tagName.toLowerCase();
       const change = msg.submit ? ` ${describeChange(before, fingerprint())}` : '';
       return { ok: true, data: `Typed into "${where.slice(0, 40)}"${msg.submit ? ' and submitted.' : '.'}${change}` };
+    }
+
+    case 'list_images':
+      return { ok: true, data: collectImages() };
+
+    case 'fetch_asset': {
+      if (!msg.url) return { ok: false, error: 'No url given.' };
+      return { ok: true, data: await fetchAsset(String(msg.url)) };
+    }
+
+    case 'save_blob': {
+      if (!msg.dataUrl) return { ok: false, error: 'Nothing to save.' };
+      anchorSave(String(msg.dataUrl), String(msg.filename || 'download'));
+      return { ok: true, data: `Saved ${msg.filename}` };
     }
 
     case 'list_actions': {
