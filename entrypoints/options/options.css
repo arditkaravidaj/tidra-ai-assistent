@@ -1,0 +1,464 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display',
+    'Helvetica Neue', 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  letter-spacing: -0.01em;
+}
+
+body {
+  background: #f2f2f7;
+  color: #000;
+}
+
+.wrap {
+  position: relative;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+/* Same background footage as the home page. */
+.opt-video {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  z-index: 0;
+  pointer-events: none;
+}
+
+.card {
+  position: relative;
+  z-index: 1;
+  background: #ffffff;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 22px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.28);
+  padding: 40px 44px;
+  width: 100%;
+  max-width: 760px;
+  animation: tidra-card-enter 0.55s cubic-bezier(0.22, 0.61, 0.36, 1) backwards;
+}
+
+/* Landing-page style reveal — same motion as the Tidra home page: the card
+   eases in, then its sections rise up and unblur into place, staggered. */
+@keyframes tidra-card-enter {
+  from { opacity: 0; transform: translateY(10px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes tidra-opt-enter {
+  from { opacity: 0; transform: translateY(16px) scale(0.99); filter: blur(7px); }
+  to { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
+.brand { animation: tidra-opt-enter 0.55s cubic-bezier(0.22, 0.61, 0.36, 1) 0.1s backwards; }
+.sub { animation: tidra-opt-enter 0.55s cubic-bezier(0.22, 0.61, 0.36, 1) 0.16s backwards; }
+.grid { animation: tidra-opt-enter 0.55s cubic-bezier(0.22, 0.61, 0.36, 1) 0.22s backwards; }
+.routine-row { animation: tidra-opt-enter 0.55s cubic-bezier(0.22, 0.61, 0.36, 1) 0.28s backwards; }
+.save { animation: tidra-opt-enter 0.55s cubic-bezier(0.22, 0.61, 0.36, 1) 0.34s backwards; }
+@media (prefers-reduced-motion: reduce) {
+  .card, .brand, .sub, .grid, .routine-row, .save { animation: none; }
+}
+
+/* Two-column layout: API key on the left, model & cost on the right */
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 36px;
+  margin-bottom: 28px;
+}
+
+.col {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.save {
+  margin-top: 4px;
+}
+
+.routine-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 16px 0 4px;
+  border-top: 1px solid rgba(0, 0, 0, 0.07);
+  margin-bottom: 18px;
+}
+.routine-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: rgba(0, 0, 0, 0.55);
+  cursor: pointer;
+  margin: 0;
+}
+.routine-toggle input {
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  flex-shrink: 0;
+  accent-color: #8e8e93;
+  cursor: pointer;
+}
+.routine-toggle strong {
+  color: #000;
+  font-weight: 600;
+}
+.routine-clear {
+  flex-shrink: 0;
+  width: auto;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  background: #fff;
+  color: rgba(0, 0, 0, 0.7);
+  border-radius: 12px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.routine-clear:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+@media (max-width: 480px) {
+  .grid {
+    grid-template-columns: 1fr;
+    gap: 22px;
+  }
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Tidra brand mark — the caret logo */
+.tidra-orb {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  color: #0a0a0a;
+}
+.tidra-orb svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* Wordmark — the T\DRA logotype */
+.brand-mark {
+  height: 30px;
+  width: auto;
+  color: #000;
+}
+
+.sub {
+  color: rgba(0, 0, 0, 0.4);
+  font-size: 14px;
+  margin: 6px 0 28px;
+}
+
+label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: rgba(0, 0, 0, 0.7);
+  margin-bottom: 6px;
+}
+
+input {
+  width: 100%;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 20px;
+  padding: 10px 14px;
+  font-size: 14px;
+  outline: none;
+  background: #fff;
+  transition: border-color 0.15s ease;
+}
+
+input:focus {
+  border-color: rgba(0, 0, 0, 0.45);
+}
+
+.hint {
+  font-size: 12.5px;
+  color: rgba(0, 0, 0, 0.4);
+  line-height: 1.55;
+  margin: 10px 0 22px;
+}
+
+.hint a {
+  color: rgba(0, 0, 0, 0.85);
+  text-underline-offset: 2px;
+}
+
+.divider {
+  height: 1px;
+  background: rgba(0, 0, 0, 0.08);
+  margin: 20px 0 22px;
+}
+
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  color: rgba(0, 0, 0, 0.8);
+  margin-bottom: 6px;
+}
+
+.optional {
+  font-size: 11px;
+  font-weight: 400;
+  color: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+.row {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+  margin-bottom: 22px;
+}
+
+.row > div {
+  flex: 1;
+}
+
+.row label {
+  margin-top: 0;
+}
+
+.tiers {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tier {
+  width: 100%;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 11px 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: #fff;
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 0.25s ease, background 0.25s ease, box-shadow 0.25s ease,
+    transform 0.25s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.tier:hover:not(.tier-active) {
+  border-color: rgba(0, 0, 0, 0.28);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.07);
+  transform: translateY(-1px);
+}
+.tier:active {
+  transform: translateY(0) scale(0.994);
+}
+
+.tier-active {
+  border-color: #000;
+  background: rgba(0, 0, 0, 0.03);
+}
+
+.tier-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: rgba(0, 0, 0, 0.85);
+}
+
+.tier-desc {
+  font-size: 12px;
+  color: rgba(0, 0, 0, 0.45);
+}
+
+button {
+  width: 100%;
+  border: none;
+  border-radius: 14px;
+  padding: 13px;
+  font-size: 16px;
+  font-weight: 590;
+  color: #ffffff;
+  cursor: pointer;
+  background: #0a0a0a;
+  transition: transform 0.25s cubic-bezier(0.22, 0.61, 0.36, 1),
+    box-shadow 0.25s ease, background 0.25s ease, opacity 0.25s ease;
+}
+
+button:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+button:active:not(:disabled) {
+  transform: translateY(0) scale(0.99);
+}
+
+button:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+/* Save — the primary action gets a soft lift-shadow on hover. */
+.save:hover:not(:disabled) {
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.22);
+}
+
+/* Secondary "Clear routine data" button */
+.routine-clear:hover {
+  background: rgba(0, 0, 0, 0.045);
+  border-color: rgba(0, 0, 0, 0.2);
+  box-shadow: 0 5px 14px rgba(0, 0, 0, 0.06);
+}
+
+/* ── Your profile (user-entered, never auto-collected) ───────────────────── */
+.profile-row {
+  padding: 16px 0 4px;
+  border-top: 1px solid rgba(0, 0, 0, 0.07);
+  margin-bottom: 18px;
+  animation: tidra-opt-enter 0.55s cubic-bezier(0.22, 0.61, 0.36, 1) 0.26s backwards;
+}
+.profile-hint {
+  margin: 6px 0 16px;
+}
+.profile-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 14px 16px;
+  margin-bottom: 16px;
+}
+@media (max-width: 720px) {
+  .profile-grid { grid-template-columns: 1fr 1fr; }
+}
+.profile-about {
+  width: 100%;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 16px;
+  padding: 11px 14px;
+  font-size: 14px;
+  line-height: 1.5;
+  outline: none;
+  resize: vertical;
+  background: #fff;
+  transition: border-color 0.15s ease;
+}
+.profile-about:focus {
+  border-color: rgba(0, 0, 0, 0.45);
+}
+.profile-hint strong {
+  color: rgba(0, 0, 0, 0.72);
+  font-weight: 600;
+}
+/* Clear sits right-aligned, echoing the routine row below it. */
+.profile-foot {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+/* ── Confirm dialog ──────────────────────────────────────────────────────── */
+/* Clearing can't be undone, so it always goes through here. */
+.confirm-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.32);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  animation: confirm-fade 0.18s ease backwards;
+}
+@keyframes confirm-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.confirm {
+  width: 100%;
+  max-width: 380px;
+  padding: 22px 24px 20px;
+  border-radius: 22px;
+  background: #fff;
+  box-shadow: 0 26px 70px rgba(0, 0, 0, 0.34);
+  animation: confirm-pop 0.24s cubic-bezier(0.22, 0.61, 0.36, 1) backwards;
+}
+@keyframes confirm-pop {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+.confirm h3 {
+  margin: 0 0 8px;
+  font-size: 17px;
+  font-weight: 600;
+  color: #0f1114;
+}
+.confirm p {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: rgba(0, 0, 0, 0.55);
+}
+.confirm-foot {
+  display: flex;
+  gap: 10px;
+  margin-top: 20px;
+}
+.confirm-foot button {
+  flex: 1;
+  padding: 11px;
+  font-size: 14px;
+  font-weight: 560;
+  border-radius: 13px;
+}
+.confirm-cancel {
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  background: #fff;
+  color: rgba(0, 0, 0, 0.7);
+}
+.confirm-cancel:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+.confirm-go {
+  border: 0;
+  background: #d7362f;
+  color: #fff;
+}
+.confirm-go:hover {
+  background: #c22e28;
+  box-shadow: 0 8px 20px rgba(215, 54, 47, 0.3);
+}
+
+/* Provider picker — two cards side by side above the key field. */
+.provider-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+.model-note {
+  margin: 10px 0 0;
+  font-size: 11.5px;
+}

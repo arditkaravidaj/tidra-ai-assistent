@@ -1,0 +1,1100 @@
+/* Tidra — native iOS styling. Lives in Shadow DOM, immune to page CSS. */
+
+:host {
+  all: initial;
+}
+
+* {
+  box-sizing: border-box;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display',
+    'Helvetica Neue', 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ============ Collapsed island — iOS Dynamic Island ============ */
+.tidra-island {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border: 0.5px solid rgba(0, 0, 0, 0.06);
+  cursor: grab;
+  background: rgba(255, 255, 255, 0.82);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
+  border-radius: 16px;
+  padding: 9px;
+  min-width: 0;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.18), 0 2px 6px rgba(0, 0, 0, 0.08);
+  transition: transform 0.16s ease-out, box-shadow 0.22s ease;
+  animation: tidra-island-in 0.32s cubic-bezier(0.32, 0.72, 0, 1);
+  transform-origin: center;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* While working, widen back into a pill to fit "Working…" + Stop. */
+.tidra-island-busy {
+  gap: 8px;
+  border-radius: 18px;
+  padding: 13px 20px 13px 14px;
+}
+
+.tidra-island:active {
+  cursor: grabbing;
+}
+
+.tidra-island:hover {
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.22), 0 2px 6px rgba(0, 0, 0, 0.1);
+}
+
+.tidra-island-free {
+  transform: none;
+  animation: none;
+}
+
+.tidra-island.tidra-dragging {
+  transition: box-shadow 0.22s ease;
+}
+
+.tidra-island-label {
+  font-family: 'Mondwest', -apple-system, sans-serif;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: 0;
+  color: #000;
+}
+
+/* "Tidra" wordmark — PP Mondwest pixel font */
+
+@keyframes tidra-island-in {
+  from { transform: translateX(-50%) translateY(-16px) scale(0.8); opacity: 0; }
+  to { transform: translateX(-50%) translateY(0) scale(1); opacity: 1; }
+}
+
+/* Collapsed island states */
+.tidra-island-working {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 14px;
+  font-weight: 500;
+  color: rgba(60, 60, 67, 0.78);
+}
+.tidra-island-working i {
+  width: 3px;
+  height: 3px;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: rgba(60, 60, 67, 0.7);
+  animation: tidra-island-dot 1.2s ease-in-out infinite;
+}
+.tidra-island-working i:nth-of-type(2) { animation-delay: 0.18s; }
+.tidra-island-working i:nth-of-type(3) { animation-delay: 0.36s; }
+@keyframes tidra-island-dot {
+  0%, 60%, 100% { opacity: 0.3; }
+  30% { opacity: 1; }
+}
+
+/* iOS notification card — the answer, shown BELOW the island */
+.tidra-card {
+  position: fixed;
+  top: 80px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  width: 340px;
+  max-width: calc(100vw - 28px);
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  text-align: left;
+  padding: 13px 15px;
+  border: 0.5px solid rgba(0, 0, 0, 0.06);
+  border-radius: 22px 22px 22px 6px;
+  background: rgba(255, 255, 255, 0.82);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.18), 0 2px 6px rgba(0, 0, 0, 0.08);
+  cursor: pointer;
+  animation: tidra-card-in 0.32s cubic-bezier(0.32, 0.72, 0, 1);
+  transition: transform 0.14s ease;
+}
+
+.tidra-card:hover {
+  transform: translateX(-50%) scale(1.015);
+}
+
+.tidra-card:active {
+  transform: translateX(-50%) scale(0.99);
+}
+
+/* Dragged position — no centering transform */
+.tidra-card-free {
+  transform: none;
+  animation: none;
+}
+.tidra-card-free:hover {
+  transform: scale(1.015);
+}
+.tidra-card-free:active {
+  transform: scale(0.99);
+}
+
+@keyframes tidra-card-in {
+  from { transform: translateX(-50%) translateY(-10px) scale(0.94); opacity: 0; }
+  to { transform: translateX(-50%) translateY(0) scale(1); opacity: 1; }
+}
+
+.tidra-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding-right: 16px; /* keep text clear of the dismiss ✕ */
+}
+
+/* Small ✕ to dismiss the answer preview without opening the panel. */
+.tidra-card-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 21px;
+  height: 21px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.06);
+  color: rgba(60, 60, 67, 0.7);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 0.14s ease, background 0.14s ease, color 0.14s ease;
+}
+.tidra-card:hover .tidra-card-close {
+  opacity: 1;
+}
+.tidra-card-close:hover {
+  background: rgba(0, 0, 0, 0.12);
+  color: #000;
+}
+
+.tidra-card-title {
+  height: 13px;
+  width: auto;
+  align-self: flex-start;
+  color: #000;
+}
+
+.tidra-card-text {
+  font-size: 14px;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+  color: rgba(60, 60, 67, 0.78);
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* Inline formatting, matching the chat bubble. */
+.tidra-card-text strong {
+  font-weight: 600;
+  color: rgba(60, 60, 67, 0.95);
+}
+.tidra-card-text em {
+  font-style: italic;
+}
+.tidra-card-text code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.92em;
+  padding: 1px 4px;
+  border-radius: 5px;
+  background: rgba(120, 120, 128, 0.16);
+}
+
+/* Confirm/Cancel directly on the collapsed island */
+.tidra-island-actions {
+  padding: 7px 8px 7px 11px;
+  gap: 7px;
+  cursor: default;
+}
+.tidra-mini {
+  border: none;
+  border-radius: 999px;
+  padding: 7px 14px;
+  font-size: 13.5px;
+  font-weight: 590;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  transition: transform 0.12s ease, opacity 0.12s ease;
+  white-space: nowrap;
+}
+.tidra-mini:active { transform: scale(0.95); }
+.tidra-mini-yes {
+  background: #8fd44f;
+  color: #143407;
+}
+.tidra-mini-no {
+  background: rgba(120, 120, 128, 0.14);
+  color: rgba(60, 60, 67, 0.85);
+  padding: 7px 11px;
+}
+
+/* Siri orb — layered conic gradients rotated via an animated angle, then
+   blur()+contrast() fuses them into liquid metaball blobs. Identical everywhere. */
+@property --tidra-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+/* Tidra brand mark — the caret logo (same as the app icon). */
+.tidra-orb {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  color: #0a0a0a;
+  transition: transform 0.25s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* Hovering the island or the panel header spins the mark a quarter-turn. */
+.tidra-island:hover .tidra-orb,
+.tidra-header:hover .tidra-orb {
+  transform: rotate(90deg);
+}
+.tidra-orb svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.tidra-orb-sm {
+  width: 32px;
+  height: 32px;
+}
+
+/* Thinking — the caret gently bobs up and down */
+.tidra-orb-thinking {
+  animation: tidra-orb-bob 0.9s ease-in-out infinite;
+}
+@keyframes tidra-orb-bob {
+  0%, 100% { transform: translateY(1.5px); }
+  50% { transform: translateY(-1.5px); }
+}
+
+/* ============ Open panel — iOS sheet ============ */
+.tidra-panel {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  width: 400px;
+  max-width: calc(100vw - 28px);
+  height: 540px;
+  max-height: calc(100vh - 28px);
+  display: flex;
+  flex-direction: column;
+  background: #ffffff;
+  border: 0.5px solid rgba(0, 0, 0, 0.08);
+  border-radius: 20px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.24), 0 3px 10px rgba(0, 0, 0, 0.08);
+  overflow: hidden;
+  transform-origin: top center;
+  /* iOS spring open — scale + fade in with a gentle settle. */
+  animation: tidra-in-center 0.34s cubic-bezier(0.32, 0.72, 0, 1);
+  color: #000;
+}
+
+/* iOS-style shrink + fade close (held on the last frame until unmount). */
+.tidra-panel.tidra-panel-closing {
+  animation: tidra-out-center 0.2s cubic-bezier(0.4, 0, 0.9, 0.3) forwards;
+  pointer-events: none;
+}
+
+@keyframes tidra-in-center {
+  from { transform: translateX(-50%) translateY(-6px) scale(0.88); opacity: 0; }
+  to   { transform: translateX(-50%) translateY(0) scale(1); opacity: 1; }
+}
+@keyframes tidra-out-center {
+  from { transform: translateX(-50%) translateY(0) scale(1); opacity: 1; }
+  to   { transform: translateX(-50%) translateY(-4px) scale(0.9); opacity: 0; }
+}
+
+/* Once dragged, the panel is pinned by explicit left/top (set inline) — drop
+   the centering translate and scale from its own center instead. */
+.tidra-panel-free {
+  left: 0;
+  top: 0;
+  transform: none;
+  transform-origin: center;
+  animation-name: tidra-in-free;
+}
+.tidra-panel-free.tidra-panel-closing {
+  animation-name: tidra-out-free;
+}
+
+@keyframes tidra-in-free {
+  from { transform: scale(0.88); opacity: 0; }
+  to   { transform: scale(1); opacity: 1; }
+}
+@keyframes tidra-out-free {
+  from { transform: scale(1); opacity: 1; }
+  to   { transform: scale(0.9); opacity: 0; }
+}
+
+/* No animation while actively dragging, so the tilt/position doesn't fight it. */
+.tidra-panel-dragging {
+  animation: none;
+  transition: none;
+  user-select: none;
+}
+
+/* Once the panel has finished entering, freeze the animation entirely. This
+   stops later class changes (becoming "free" on drag, or a browser zoom repaint)
+   from restarting the open animation and flashing the panel. */
+.tidra-panel-static {
+  animation: none;
+}
+
+/* Header — iOS nav bar */
+.tidra-header {
+  cursor: grab;
+  touch-action: none;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 13px 14px;
+  background: rgba(255, 255, 255, 0.82);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  backdrop-filter: blur(20px) saturate(180%);
+  border-bottom: 0.5px solid rgba(60, 60, 67, 0.14);
+}
+
+.tidra-panel-dragging .tidra-header {
+  cursor: grabbing;
+}
+
+.tidra-title {
+  cursor: inherit;
+  height: calc(19px * var(--tidra-fs, 1));
+  width: auto;
+  flex: 0 0 auto;
+  margin-right: auto;
+  color: #0a0a0a;
+}
+
+.tidra-icon-btn {
+  border: none;
+  background: rgba(120, 120, 128, 0.12);
+  cursor: pointer;
+  color: rgba(60, 60, 67, 0.72);
+  width: 42px;
+  height: 42px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s ease, color 0.12s ease, transform 0.12s ease;
+  padding: 0;
+  line-height: 1;
+}
+.tidra-icon-btn svg {
+  display: block;
+}
+.tidra-icon-btn:active {
+  transform: scale(0.92);
+}
+
+.tidra-icon-btn:hover {
+  background: rgba(120, 120, 128, 0.2);
+  color: rgba(0, 0, 0, 0.85);
+}
+
+/* Messages — Dia-style thread on white */
+.tidra-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 18px 18px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: transparent;
+}
+
+/* Landing-page style reveal — same as the Tidra home page: content rises up
+   and unblurs into place, cascading, when the panel opens (and each new
+   message reveals the same way as it arrives). */
+@keyframes tidra-enter {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.99);
+    filter: blur(7px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
+}
+.tidra-messages > * {
+  animation: tidra-enter 0.5s cubic-bezier(0.22, 0.61, 0.36, 1) backwards;
+}
+.tidra-messages > *:nth-child(1) { animation-delay: 0.06s; }
+.tidra-messages > *:nth-child(2) { animation-delay: 0.11s; }
+.tidra-messages > *:nth-child(3) { animation-delay: 0.16s; }
+.tidra-messages > *:nth-child(4) { animation-delay: 0.21s; }
+.tidra-messages > *:nth-child(5) { animation-delay: 0.26s; }
+.tidra-messages > *:nth-child(6) { animation-delay: 0.31s; }
+.tidra-confirm {
+  animation: tidra-enter 0.5s cubic-bezier(0.22, 0.61, 0.36, 1) 0.14s backwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .tidra-messages > *,
+  .tidra-confirm {
+    animation: none;
+  }
+}
+
+.tidra-empty {
+  color: rgba(60, 60, 67, 0.5);
+  font-size: calc(15px * var(--tidra-fs, 1));
+  line-height: 1.55;
+  letter-spacing: -0.01em;
+  text-align: center;
+  margin: auto 24px;
+  padding: 0;
+}
+
+/* User message — blue bubble anchored right: squared bottom-right corner. */
+.tidra-msg-user {
+  align-self: flex-end;
+  background: #ececef;
+  color: #1c1c1e;
+  font-size: calc(16px * var(--tidra-fs, 1));
+  line-height: 1.4;
+  letter-spacing: -0.01em;
+  padding: 11px 17px;
+  border-radius: 20px 20px 5px 20px;
+  max-width: 82%;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Assistant reply — grey bubble anchored left: squared bottom-left corner. */
+.tidra-answer {
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+/* Assistant reply — plain formatted text (no bubble), markdown rendered. */
+.tidra-answer-text {
+  color: #1c1c1e;
+  font-size: calc(16px * var(--tidra-fs, 1));
+  line-height: 1.55;
+  letter-spacing: -0.01em;
+  max-width: 100%;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tidra-answer-text strong {
+  font-weight: 680;
+}
+.tidra-answer-text em {
+  font-style: italic;
+}
+.tidra-answer-text code {
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 0.9em;
+  background: rgba(0, 0, 0, 0.06);
+  padding: 1px 5px;
+  border-radius: 5px;
+}
+
+/* Error reply — same bubble shape, tinted red. */
+.tidra-answer-error {
+  align-self: flex-start;
+  background: #ffe2e4;
+  color: #c70012;
+  font-size: calc(15.5px * var(--tidra-fs, 1));
+  line-height: 1.45;
+  letter-spacing: -0.01em;
+  padding: 11px 16px;
+  border-radius: 20px 20px 20px 5px;
+  max-width: 82%;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Action row under each assistant reply */
+.tidra-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.tidra-act {
+  width: 30px;
+  height: 30px;
+  border: none;
+  background: transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  color: rgba(60, 60, 67, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s ease, color 0.12s ease;
+  padding: 0;
+}
+
+.tidra-act:hover {
+  background: rgba(120, 120, 128, 0.12);
+  color: rgba(0, 0, 0, 0.85);
+}
+
+.tidra-act-on {
+  color: #3f9a1c;
+}
+
+/* Typing indicator — three plain dots, no bubble (left aligned) */
+.tidra-typing {
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 2px;
+}
+.tidra-typing span {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(60, 60, 67, 0.35);
+  animation: tidra-typing 1.25s ease-in-out infinite;
+}
+.tidra-typing span:nth-child(2) { animation-delay: 0.18s; }
+.tidra-typing span:nth-child(3) { animation-delay: 0.36s; }
+
+@keyframes tidra-typing {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.35; }
+  30% { transform: translateY(-4px); opacity: 0.9; }
+}
+
+.tidra-settings-link {
+  align-self: flex-start;
+  border: none;
+  background: transparent;
+  color: #3f9a1c;
+  cursor: pointer;
+  font-size: 14px;
+  letter-spacing: -0.01em;
+  padding: 2px 0;
+}
+
+
+/* Confirm / Cancel — iOS action card */
+.tidra-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 14px 16px;
+  margin: 4px 14px 12px;
+  background: #f2f2f7;
+  border-radius: 18px;
+}
+
+.tidra-confirm-label {
+  font-size: 13.5px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: rgba(60, 60, 67, 0.75);
+  text-align: center;
+}
+
+.tidra-confirm-btns {
+  display: flex;
+  gap: 9px;
+}
+
+.tidra-confirm-btns button {
+  flex: 1;
+  border-radius: 14px;
+  padding: 11px 12px;
+  font-size: 15px;
+  font-weight: 590;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  transition: transform 0.12s ease, opacity 0.12s ease;
+}
+
+.tidra-confirm-no {
+  border: none;
+  background: rgba(120, 120, 128, 0.16);
+  color: #3f9a1c;
+}
+
+.tidra-confirm-yes {
+  border: none;
+  background: #8fd44f;
+  color: #143407;
+}
+
+.tidra-confirm-btns button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.tidra-confirm-btns button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Composer — Dia-style rounded pill with inline icons */
+.tidra-inputbar {
+  position: relative; /* anchors the Manual/Auto popover */
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin: 8px 14px 14px;
+  padding: 6px 7px 6px 18px;
+  background: #fff;
+  border: 0.5px solid rgba(60, 60, 67, 0.18);
+  border-radius: 26px;
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.06);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.tidra-inputbar:focus-within {
+  border-color: rgba(60, 60, 67, 0.3);
+  box-shadow: 0 3px 18px rgba(0, 0, 0, 0.09);
+}
+
+.tidra-inputbar textarea {
+  flex: 1;
+  resize: none;
+  border: none;
+  padding: 7px 0;
+  font-size: calc(16px * var(--tidra-fs, 1));
+  line-height: 1.4;
+  letter-spacing: -0.01em;
+  outline: none;
+  max-height: 100px;
+  background: transparent;
+  color: #000;
+}
+
+.tidra-inputbar textarea::placeholder {
+  color: rgba(60, 60, 67, 0.42);
+}
+
+.tidra-input-icon {
+  width: 33px;
+  height: 33px;
+  border: none;
+  background: transparent;
+  border-radius: 50%;
+  cursor: pointer;
+  color: rgba(60, 60, 67, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.12s ease, color 0.12s ease;
+  padding: 0;
+}
+
+.tidra-input-icon:hover {
+  background: rgba(120, 120, 128, 0.12);
+  color: rgba(0, 0, 0, 0.8);
+}
+
+.tidra-send {
+  width: 33px;
+  height: 33px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  color: #ffffff;
+  background: #0a0a0a;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-left: 2px;
+  transition: transform 0.12s ease, background 0.12s ease, color 0.12s ease;
+  padding: 0;
+}
+
+.tidra-send:active:not(:disabled) {
+  transform: scale(0.9);
+}
+
+.tidra-send:disabled {
+  background: rgba(120, 120, 128, 0.16);
+  color: rgba(60, 60, 67, 0.4);
+  cursor: default;
+}
+
+/* Stop button — replaces Send while Tidra is working */
+.tidra-send.tidra-send-stop {
+  background: #1c1c1e;
+  color: #fff;
+  cursor: pointer;
+}
+
+/* Bottom-right resize grip on the panel */
+.tidra-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 22px;
+  height: 22px;
+  cursor: nwse-resize;
+  touch-action: none;
+  z-index: 4;
+}
+.tidra-resize::after {
+  content: '';
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid rgba(60, 60, 67, 0.4);
+  border-bottom: 2px solid rgba(60, 60, 67, 0.4);
+  border-radius: 0 0 3px 0;
+  transition: border-color 0.12s ease;
+}
+.tidra-resize:hover::after {
+  border-color: rgba(0, 0, 0, 0.6);
+}
+
+/* Routine suggestion card — proactive "continue your routine?" prompt */
+.tidra-routine {
+  position: fixed;
+  top: 66px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  width: 300px;
+  max-width: calc(100vw - 28px);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 15px 16px;
+  border: 0.5px solid rgba(0, 0, 0, 0.06);
+  border-radius: 22px 22px 22px 6px;
+  background: rgba(255, 255, 255, 0.9);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.18), 0 2px 6px rgba(0, 0, 0, 0.08);
+  animation: tidra-card-in 0.32s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.tidra-routine-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tidra-routine-title {
+  font-size: 15px;
+  font-weight: 640;
+  letter-spacing: -0.01em;
+  color: #000;
+}
+.tidra-routine-sites {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.tidra-routine-chip {
+  font-size: 12.5px;
+  font-weight: 550;
+  color: #22401a;
+  background: #dcefc4;
+  border-radius: 999px;
+  padding: 4px 11px;
+}
+.tidra-routine-btns {
+  display: flex;
+  gap: 8px;
+}
+.tidra-routine-btns button {
+  flex: 1;
+  border: none;
+  border-radius: 13px;
+  padding: 9px;
+  font-size: 14px;
+  font-weight: 590;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  transition: transform 0.12s ease, background 0.12s ease;
+}
+.tidra-routine-btns button:active {
+  transform: scale(0.97);
+}
+.tidra-routine-no {
+  background: rgba(120, 120, 128, 0.14);
+  color: rgba(60, 60, 67, 0.85);
+}
+.tidra-routine-yes {
+  background: #8fd44f;
+  color: #143407;
+}
+
+/* Stop button on the collapsed island's "Working…" pill */
+.tidra-island-stop {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-left: 3px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  color: rgba(60, 60, 67, 0.7);
+  background: rgba(120, 120, 128, 0.16);
+  cursor: pointer;
+  touch-action: none;
+}
+.tidra-island-stop:hover {
+  background: rgba(120, 120, 128, 0.3);
+  color: #000;
+}
+
+/* Working card — same slot as the answer card, but showing the request and
+   the step Tidra is on right now, so the panel doesn't have to stay open. */
+.tidra-card-working {
+  cursor: pointer;
+}
+.tidra-card-task {
+  font-size: 14px;
+  font-weight: 550;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+  color: #0f1114;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.tidra-card-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: 4px;
+  font-size: 13px;
+  color: rgba(60, 60, 67, 0.6);
+}
+.tidra-card-step i {
+  width: 3px;
+  height: 3px;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: rgba(60, 60, 67, 0.55);
+  animation: tidra-island-dot 1.2s ease-in-out infinite;
+}
+.tidra-card-step i:nth-of-type(2) { animation-delay: 0.18s; }
+.tidra-card-step i:nth-of-type(3) { animation-delay: 0.36s; }
+
+/* Manual / Auto — how far Tidra goes without asking. It sits in the input bar,
+   next to send, because that is the moment the choice matters. */
+.tidra-mode-pill {
+  flex-shrink: 0;
+  align-self: center;
+  border: 0.5px solid rgba(0, 0, 0, 0.1);
+  background: rgba(120, 120, 128, 0.1);
+  border-radius: 999px;
+  padding: 5px 11px;
+  font-size: 12px;
+  font-weight: 550;
+  line-height: 1.2;
+  color: rgba(60, 60, 67, 0.7);
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
+}
+.tidra-mode-pill:hover {
+  background: rgba(120, 120, 128, 0.18);
+  color: #0f1114;
+}
+.tidra-mode-pill-auto {
+  background: #0f1114;
+  border-color: transparent;
+  color: #ffffff;
+}
+.tidra-mode-pill-auto:hover {
+  background: #000000;
+  color: #ffffff;
+}
+
+.tidra-mode-catch {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+}
+.tidra-mode-pop {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 12px;
+  right: 12px;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  border-radius: 18px;
+  border: 0.5px solid rgba(0, 0, 0, 0.08);
+  background: #ffffff;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.22);
+  animation: tidra-mode-pop 0.18s cubic-bezier(0.22, 0.61, 0.36, 1) backwards;
+}
+@keyframes tidra-mode-pop {
+  from { opacity: 0; transform: translateY(6px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+.tidra-mode-choice {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  border-radius: 13px;
+  padding: 9px 11px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.tidra-mode-choice:hover {
+  background: rgba(120, 120, 128, 0.1);
+}
+.tidra-mode-choice b {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #0f1114;
+}
+.tidra-mode-choice i {
+  font-style: normal;
+  font-size: 12px;
+  line-height: 1.4;
+  color: rgba(60, 60, 67, 0.6);
+}
+.tidra-mode-picked {
+  background: rgba(120, 120, 128, 0.12);
+}
+.tidra-mode-picked b::after {
+  content: ' ✓';
+  color: rgba(60, 60, 67, 0.5);
+}
+@media (prefers-color-scheme: dark) {
+  .tidra-mode-pill {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.1);
+    color: rgba(235, 235, 245, 0.7);
+  }
+  .tidra-mode-pill:hover { background: rgba(255, 255, 255, 0.18); color: #fff; }
+  .tidra-mode-pill-auto { background: #f4f5f7; color: #0f1114; }
+  .tidra-mode-pill-auto:hover { background: #ffffff; color: #0f1114; }
+  .tidra-mode-pop { background: #1c1c1e; border-color: rgba(255, 255, 255, 0.1); }
+  .tidra-mode-choice b { color: #f2f2f7; }
+  .tidra-mode-choice i { color: rgba(235, 235, 245, 0.6); }
+  .tidra-mode-choice:hover, .tidra-mode-picked { background: rgba(255, 255, 255, 0.1); }
+}
+
+/* Attachments — chips under the messages, above the input bar. */
+.tidra-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 16px 2px;
+}
+.tidra-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 190px;
+  padding: 4px 4px 4px 5px;
+  border: 0.5px solid rgba(60, 60, 67, 0.14);
+  border-radius: 12px;
+  background: rgba(120, 120, 128, 0.08);
+  font-size: 12px;
+  color: rgba(60, 60, 67, 0.8);
+}
+.tidra-chip img {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  object-fit: cover;
+  display: block;
+}
+.tidra-chip-doc {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  background: rgba(60, 60, 67, 0.14);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: rgba(60, 60, 67, 0.75);
+}
+.tidra-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tidra-chip button {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(60, 60, 67, 0.12);
+  color: rgba(60, 60, 67, 0.7);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+.tidra-chip button:hover {
+  background: rgba(60, 60, 67, 0.22);
+}
+
+/* What was attached, shown inside the sent bubble. */
+.tidra-msg-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 6px;
+}
+.tidra-msg-files img {
+  width: 44px;
+  height: 44px;
+  border-radius: 9px;
+  object-fit: cover;
+  display: block;
+}
+@media (prefers-color-scheme: dark) {
+  .tidra-chip {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.12);
+    color: rgba(235, 235, 245, 0.8);
+  }
+  .tidra-chip-doc { background: rgba(255, 255, 255, 0.16); color: rgba(235, 235, 245, 0.8); }
+  .tidra-chip button { background: rgba(255, 255, 255, 0.14); color: rgba(235, 235, 245, 0.8); }
+}

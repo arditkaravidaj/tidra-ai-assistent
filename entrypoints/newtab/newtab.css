@@ -1,0 +1,1367 @@
+/* ── Tidra new tab — a calm, Dia-style home page ─────────────────────────── */
+
+:root {
+  /* Clean white background — no gradient; the only color is the animated
+     green/yellow glow under the ask card. */
+  --nt-bg-top: #ffffff;
+  --nt-bg-bot: #ffffff;
+  --nt-tint-a: transparent;
+  --nt-tint-b: transparent;
+  --nt-glow: rgba(180, 230, 132, 0.5);
+  --nt-fg: #0f1114;
+  --nt-muted: rgba(60, 60, 67, 0.55);
+  --nt-faint: rgba(60, 60, 67, 0.38);
+  --nt-surface: rgba(255, 255, 255, 0.95);
+  --nt-surface-2: rgba(255, 255, 255, 0.62);
+  --nt-border: rgba(0, 0, 0, 0.07);
+  --nt-shadow: 0 18px 60px rgba(60, 66, 40, 0.1), 0 2px 8px rgba(0, 0, 0, 0.04);
+  /* Two blobs that drift and blend into each other under the ask card */
+  --nt-glow-green: rgba(163, 224, 110, 0.85);
+  --nt-glow-yellow: rgba(247, 226, 102, 0.8);
+  /* User message pill — soft green tint with dark text */
+  --nt-bubble: #ececef;
+  --nt-bubble-fg: #1c1c1e;
+  --nt-send: #0f1114; /* send button */
+  --nt-send-fg: #fff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --nt-bg-top: #131722;
+    --nt-bg-bot: #0b0d12;
+    --nt-tint-a: rgba(70, 110, 210, 0.3);
+    --nt-tint-b: rgba(40, 90, 80, 0.14);
+    --nt-glow: rgba(150, 210, 90, 0.42);
+    --nt-fg: #f4f5f7;
+    --nt-muted: rgba(235, 238, 245, 0.55);
+    --nt-faint: rgba(235, 238, 245, 0.34);
+    --nt-surface: rgba(38, 41, 50, 0.78);
+    --nt-surface-2: rgba(48, 51, 61, 0.5);
+    --nt-border: rgba(255, 255, 255, 0.08);
+    --nt-shadow: 0 18px 60px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.3);
+    --nt-glow-green: rgba(120, 190, 70, 0.5);
+    --nt-glow-yellow: rgba(200, 180, 60, 0.42);
+    --nt-bubble: rgba(255, 255, 255, 0.13);
+    --nt-bubble-fg: #f0f0f2;
+    --nt-send: #f4f5f7;
+    --nt-send-fg: #0f1114;
+  }
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display',
+    'Helvetica Neue', 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  letter-spacing: -0.01em;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  color: var(--nt-fg);
+  background:
+    radial-gradient(60% 45% at 12% 100%, var(--nt-tint-b), transparent 70%),
+    radial-gradient(55% 40% at 92% 92%, var(--nt-tint-a), transparent 70%),
+    linear-gradient(180deg, var(--nt-bg-top) 0%, var(--nt-bg-bot) 100%);
+  background-attachment: fixed;
+}
+
+.nt {
+  position: relative;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 0 24px 64px;
+  overflow-x: clip;
+}
+
+/* ── Background video ────────────────────────────────────────────────────── */
+.nt-video {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  z-index: 0;
+  pointer-events: none;
+}
+/* Everything else sits above the footage. */
+.nt-mark,
+.nt-main,
+.nt-thread,
+.nt-dock {
+  position: relative;
+  z-index: 1;
+}
+/* When chatting, fill the viewport so the input can dock to the bottom. */
+.nt-chatting {
+  height: 100vh;
+  min-height: 0;
+  padding-bottom: 0;
+}
+
+
+/* ── Brand mark ──────────────────────────────────────────────────────────── */
+/* Landing-page style reveal: elements rise up and unblur into place,
+   staggered. Plays on page load, when a chat opens, and on reset to
+   a new chat (each of those remounts the elements). */
+@keyframes nt-enter {
+  from {
+    opacity: 0;
+    transform: translateY(18px) scale(0.985);
+    filter: blur(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
+}
+
+.nt-mark {
+  position: relative;
+  z-index: 1;
+  margin-top: clamp(64px, 16vh, 150px);
+  transition: margin-top 0.5s cubic-bezier(0.32, 0.72, 0, 1);
+  animation: nt-enter 0.62s cubic-bezier(0.22, 0.61, 0.36, 1) backwards;
+}
+/* When chatting, the mark tucks into the top-left as a breadcrumb. */
+.nt-chatting .nt-mark {
+  align-self: flex-start;
+  margin-top: 16px;
+}
+.nt-mark-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  padding: 6px 10px;
+  border-radius: 14px;
+  transition: background 0.16s ease;
+}
+.nt-chatting .nt-mark-btn:hover {
+  background: var(--nt-surface-2);
+}
+.nt-crumb {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--nt-fg);
+}
+
+.nt-orb {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  border-radius: 22%;
+}
+.nt-orb svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* The lone brand mark on the home page — larger app icon. */
+.nt-mark .nt-orb {
+  width: 56px;
+  height: 56px;
+  transition: transform 0.35s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.nt-mark-btn:hover .nt-orb {
+  transform: rotate(90deg);
+}
+/* Smaller mark while chatting (it sits inline with the breadcrumb). */
+.nt-chatting .nt-mark .nt-orb {
+  width: 28px;
+  height: 28px;
+  box-shadow: 0 4px 14px rgba(20, 40, 90, 0.2);
+}
+@media (prefers-color-scheme: dark) {
+  .nt-mark .nt-orb {
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.09);
+  }
+}
+.nt-orb-thinking {
+  animation: nt-bob 1.1s ease-in-out infinite;
+}
+@keyframes nt-bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+
+/* ── Main column (home / empty state) ────────────────────────────────────── */
+.nt-main {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  max-width: 680px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin-top: clamp(28px, 6vh, 56px);
+}
+
+/* ── Conversation thread ─────────────────────────────────────────────────── */
+.nt-thread {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  width: 100%;
+  max-width: 760px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 12px 4px 24px;
+  scrollbar-width: thin;
+}
+.nt-turn {
+  font-size: 15.5px;
+  line-height: 1.55;
+  animation: nt-rise 0.36s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.nt-turn-user {
+  align-self: flex-end;
+  max-width: 78%;
+  background: var(--nt-bubble);
+  color: var(--nt-bubble-fg);
+  padding: 11px 17px;
+  border-radius: 20px 20px 7px 20px;
+  white-space: pre-wrap;
+  font-weight: 460;
+}
+.nt-turn-tidra {
+  align-self: flex-start;
+  max-width: 94%;
+  color: var(--nt-fg);
+}
+.nt-turn-text {
+  white-space: pre-wrap;
+}
+.nt-turn-text strong {
+  font-weight: 680;
+}
+.nt-turn-text em {
+  font-style: italic;
+}
+.nt-turn-text code {
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 0.9em;
+  background: rgba(0, 0, 0, 0.06);
+  padding: 1px 5px;
+  border-radius: 5px;
+}
+/* Action row under each Tidra reply (Dia style). */
+.nt-msg-actions {
+  display: flex;
+  gap: 2px;
+  margin-top: 8px;
+  opacity: 0.65;
+  transition: opacity 0.16s ease;
+}
+.nt-turn-tidra:hover .nt-msg-actions {
+  opacity: 1;
+}
+.nt-msg-act {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--nt-faint);
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+.nt-msg-act:hover {
+  background: var(--nt-surface-2);
+  color: var(--nt-fg);
+}
+.nt-msg-act-on {
+  color: #3f9a1c;
+}
+@keyframes nt-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* thinking dots */
+.nt-dots {
+  display: inline-flex;
+  gap: 5px;
+  padding: 4px 0;
+}
+.nt-dots i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--nt-faint);
+  animation: nt-blink 1.3s ease-in-out infinite;
+}
+.nt-dots i:nth-child(2) { animation-delay: 0.18s; }
+.nt-dots i:nth-child(3) { animation-delay: 0.36s; }
+@keyframes nt-blink {
+  0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-3px); }
+}
+
+/* ── Ask box (home) ──────────────────────────────────────────────────────── */
+.nt-boxwrap {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  animation: nt-enter 0.62s cubic-bezier(0.22, 0.61, 0.36, 1) 0.08s backwards;
+}
+
+.nt-box {
+  position: relative;
+  width: 100%;
+  background: var(--nt-surface);
+  border: 0.5px solid var(--nt-border);
+  border-radius: 26px;
+  box-shadow: var(--nt-shadow);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
+  padding: 16px 20px 14px;
+  transition: box-shadow 0.3s ease, transform 0.18s ease;
+}
+.nt-box:focus-within {
+  box-shadow: var(--nt-shadow), 0 10px 30px rgba(0, 0, 0, 0.07);
+  transform: translateY(-1px);
+}
+.nt-box-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.nt-box-search {
+  display: inline-flex;
+  color: var(--nt-faint);
+  flex-shrink: 0;
+}
+
+/* ── Ask-box suggestions dropdown (Google / Chat / website / autocomplete) ── */
+.nt-suggest {
+  display: flex;
+  flex-direction: column;
+  margin: 12px -8px 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--nt-border);
+}
+.nt-sug {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  cursor: pointer;
+  color: var(--nt-fg);
+  /* staggered reveal as options appear */
+  animation: nt-sug-in 0.26s cubic-bezier(0.22, 0.61, 0.36, 1) backwards;
+  animation-delay: calc(var(--i, 0) * 34ms);
+}
+@keyframes nt-sug-in {
+  from { opacity: 0; transform: translateY(7px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.nt-sug-active {
+  background: var(--nt-surface-2);
+}
+.nt-sug-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+  color: var(--nt-faint);
+}
+.nt-sug-active .nt-sug-icon {
+  color: var(--nt-fg);
+}
+.nt-sug-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nt-sug-label {
+  font-weight: 500;
+}
+.nt-sug-sub {
+  color: var(--nt-faint);
+  font-weight: 400;
+}
+.nt-sug-hint {
+  flex-shrink: 0;
+  font-size: 13px;
+  color: var(--nt-faint);
+  letter-spacing: 1px;
+}
+
+/* Labelled primary button (Google / Chat / Open) shown while typing */
+.nt-go {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 38px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 999px;
+  font-size: 14.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.14s ease, filter 0.14s ease;
+}
+.nt-go:hover {
+  transform: scale(1.03);
+}
+.nt-go-google {
+  background: var(--nt-send);
+  color: var(--nt-send-fg);
+}
+.nt-go-chat {
+  background: #0a0a0a;
+  color: #ffffff;
+}
+.nt-input {
+  width: 100%;
+  border: 0;
+  background: none;
+  resize: none;
+  outline: none;
+  color: var(--nt-fg);
+  font-size: 18px;
+  line-height: 1.4;
+  max-height: 180px;
+}
+.nt-input::placeholder {
+  color: var(--nt-faint);
+}
+.nt-box-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 12px;
+}
+.nt-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 13px 7px 11px;
+  border-radius: 13px;
+  border: 0.5px solid var(--nt-border);
+  background: var(--nt-surface-2);
+  color: var(--nt-muted);
+  font-size: 13.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 0.14s ease, background 0.14s ease;
+}
+.nt-chip:hover {
+  color: var(--nt-fg);
+}
+/* Start routine — the one chip that acts, so it wears the send button's black. */
+.nt-chip-run {
+  border-color: transparent;
+  background: var(--nt-send);
+  color: var(--nt-send-fg);
+  font-weight: 550;
+  transition: background 0.25s ease, transform 0.25s cubic-bezier(0.22, 0.61, 0.36, 1),
+    box-shadow 0.25s ease;
+}
+.nt-chip-run:hover {
+  color: var(--nt-send-fg);
+  transform: translateY(-1px);
+  filter: brightness(1.12);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.22);
+}
+.nt-chip-run:active {
+  transform: translateY(0) scale(0.99);
+}
+.nt-box-actions {
+  margin-left: auto;
+}
+.nt-box-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.nt-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: var(--nt-faint);
+  cursor: pointer;
+}
+.nt-send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--nt-send);
+  color: var(--nt-send-fg);
+  cursor: pointer;
+  transition: transform 0.14s ease, opacity 0.14s ease;
+}
+.nt-send:hover:not(:disabled) {
+  transform: scale(1.06);
+}
+.nt-send:disabled {
+  opacity: 0.32;
+  cursor: default;
+}
+.nt-stop-sq {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  background: currentColor;
+}
+
+/* ── Bottom-docked ask bar (while chatting) ──────────────────────────────── */
+.nt-dock {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  padding: 12px 0 22px;
+  background: linear-gradient(180deg, transparent, var(--nt-bg-bot) 42%);
+  animation: nt-enter 0.55s cubic-bezier(0.22, 0.61, 0.36, 1) 0.06s backwards;
+}
+.nt-dockbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  max-width: 760px;
+  padding: 8px 8px 8px 12px;
+  background: var(--nt-surface);
+  border: 0.5px solid var(--nt-border);
+  border-radius: 28px;
+  box-shadow: var(--nt-shadow);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
+  transition: box-shadow 0.3s ease;
+}
+.nt-dockbar:focus-within {
+  box-shadow: var(--nt-shadow), 0 4px 18px rgba(0, 0, 0, 0.06);
+}
+.nt-dock-input {
+  font-size: 16px;
+  padding: 6px 4px;
+  max-height: 120px;
+}
+
+/* ── Tagline ─────────────────────────────────────────────────────────────── */
+.nt-tag {
+  margin-top: 84px;
+  text-align: center;
+  /* break out of the 680px column so the lines don't wrap mid-phrase */
+  width: max-content;
+  max-width: 92vw;
+  text-wrap: balance;
+  font-size: clamp(26px, 4.2vw, 52px);
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: -0.022em;
+  color: #ffffff;
+  /* keeps the white readable wherever the footage goes pale */
+  text-shadow: 0 2px 18px rgba(0, 0, 0, 0.38), 0 1px 3px rgba(0, 0, 0, 0.28);
+  animation: nt-enter 0.62s cubic-bezier(0.22, 0.61, 0.36, 1) 0.17s backwards;
+}
+
+/* Key phrases set in PP Mondwest — the pixel display face used for the
+   Tidra wordmark — mixed into the normal sans.
+   They stay blank while the headline settles, flicker on like a neon tube,
+   then hold a live electric glow. */
+.nt-pixel {
+  font-family: 'Mondwest', -apple-system, sans-serif;
+  font-weight: 700; /* Mondwest ships a real bold face */
+  letter-spacing: 0;
+  font-size: 1.16em; /* the pixel face runs optically smaller */
+  display: inline-block;
+  /* steps() rather than a smooth ease — the blur resolves in discrete jumps,
+     which reads as pixel-native instead of a soft photographic focus pull.
+     Starts while the headline is still arriving so it doesn't lag behind. */
+  animation: nt-pixel-settle 0.5s steps(6) 0.22s both;
+}
+
+/* Blurred, over-contrasted and vertically squashed, settling into place. */
+@keyframes nt-pixel-settle {
+  0% {
+    opacity: 0;
+    filter: blur(6px) contrast(1.6);
+    transform: translateY(0.08em) scaleY(1.18);
+  }
+  55% {
+    opacity: 1;
+    filter: blur(1.5px) contrast(1.2);
+  }
+  100% {
+    opacity: 1;
+    filter: blur(0) contrast(1);
+    transform: translateY(0) scaleY(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nt-pixel {
+    animation: none;
+  }
+}
+
+/* ── Connect card (no API key yet) ───────────────────────────────────────── */
+.nt-connect {
+  margin-top: 26px;
+  width: 100%;
+  max-width: 520px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px 14px 18px;
+  background: var(--nt-surface);
+  border: 0.5px solid var(--nt-border);
+  border-radius: 18px;
+  box-shadow: var(--nt-shadow);
+  animation: nt-enter 0.62s cubic-bezier(0.22, 0.61, 0.36, 1) 0.22s backwards;
+}
+.nt-connect-info {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 14.5px;
+  color: var(--nt-muted);
+}
+.nt-connect-info .nt-orb {
+  width: 26px;
+  height: 26px;
+}
+.nt-connect-btn {
+  flex-shrink: 0;
+  padding: 9px 20px;
+  border: 0;
+  border-radius: 12px;
+  background: var(--nt-send);
+  color: var(--nt-send-fg);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.14s ease;
+}
+.nt-connect-btn:hover {
+  transform: scale(1.03);
+}
+
+/* ── Quick-launch rail ───────────────────────────────────────────────────── */
+/* Apps sit in grey pills (icon + name) in a horizontal row that scrolls
+   right-to-left on its own; hovering pauses it so a pill is easy to click. */
+.nt-rail {
+  position: relative;
+  z-index: 1;
+  width: 100vw;
+  margin-left: calc(50% - 50vw); /* break out to full viewport width */
+  margin-top: 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 7%, #000 93%, transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 7%, #000 93%, transparent);
+  animation: nt-enter 0.7s cubic-bezier(0.22, 0.61, 0.36, 1) 0.26s backwards;
+}
+.nt-rail-track {
+  display: flex;
+  width: max-content;
+  gap: 13px;
+  padding: 0 7px;
+  animation: nt-marquee calc(var(--n, 8) * 3.1s) linear infinite;
+}
+.nt-rail-rev {
+  animation-direction: reverse; /* second row drifts the other way */
+}
+.nt-rail:hover .nt-rail-track {
+  animation-play-state: paused;
+}
+@keyframes nt-marquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); } /* one full copy — seamless loop, no gap */
+}
+
+.nt-app {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  flex-shrink: 0;
+  padding: 10px 18px 10px 12px;
+  border: 0;
+  border-radius: 16px;
+  background: rgba(60, 60, 67, 0.07); /* grey holder */
+  cursor: pointer;
+  transition: background 0.16s ease, transform 0.16s ease;
+}
+.nt-app:hover {
+  background: rgba(60, 60, 67, 0.12);
+  transform: translateY(-2px);
+}
+.nt-app-ico {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  flex-shrink: 0;
+  display: block;
+}
+.nt-app-letter {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--nt-fg);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+}
+.nt-app-name {
+  font-size: 15px;
+  font-weight: 550;
+  color: var(--nt-fg);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nt-rail-track,
+  .nt-mark,
+  .nt-box,
+  .nt-tag,
+  .nt-connect,
+  .nt-rail,
+  .nt-dock,
+  .nt-turn {
+    animation: none;
+  }
+}
+
+/* Wordmark beside the icon on the home screen */
+.nt-wordmark {
+  height: 26px;
+  width: auto;
+  /* Always dark — the home page sits on the light video, even in dark mode. */
+  color: #0f1114;
+  flex-shrink: 0;
+}
+
+/* ── Your routine (home) ─────────────────────────────────────────────────── */
+.nt-routine {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  max-width: 560px;
+  margin-top: 40px;
+  animation: nt-enter 0.62s cubic-bezier(0.22, 0.61, 0.36, 1) 0.24s backwards;
+}
+.nt-routine-head {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  margin: 0 4px 12px;
+}
+.nt-routine-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.45);
+}
+.nt-routine-chev {
+  display: inline-flex;
+  transition: transform 0.2s ease;
+}
+.nt-routine-closed .nt-routine-chev {
+  transform: rotate(-90deg);
+}
+.nt-routine-openall {
+  border: 0;
+  background: rgba(255, 255, 255, 0.92);
+  color: #0a0a0a;
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 6px 13px;
+  border-radius: 999px;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16);
+  transition: transform 0.14s ease;
+}
+.nt-routine-openall:hover {
+  transform: scale(1.04);
+}
+.nt-routine-list {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 9px;
+}
+/* Solid white cards so they read over the background video. */
+.nt-rchip {
+  display: inline-flex;
+  align-items: center;
+  background: rgba(255, 255, 255, 0.95);
+  border: 0.5px solid rgba(0, 0, 0, 0.06);
+  border-radius: 14px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.14);
+  overflow: hidden;
+}
+.nt-rchip-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  padding: 8px 6px 8px 11px;
+  color: #0f1114;
+}
+.nt-rchip-open:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+.nt-rchip-ico {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  flex-shrink: 0;
+  display: block;
+}
+.nt-rchip-letter {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #ececef;
+  font-size: 12px;
+  font-weight: 600;
+  color: #0f1114;
+}
+.nt-rchip-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: #0f1114;
+  white-space: nowrap;
+}
+.nt-rchip-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  align-self: stretch;
+  border: 0;
+  background: none;
+  color: rgba(60, 60, 67, 0.42);
+  cursor: pointer;
+  transition: color 0.14s ease, background 0.14s ease;
+}
+.nt-rchip-x:hover {
+  color: #d11;
+  background: rgba(0, 0, 0, 0.04);
+}
+
+/* Empty state before a routine has been learned */
+.nt-routine-empty {
+  margin: 2px auto;
+  max-width: 440px;
+  text-align: center;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.9);
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.45);
+}
+
+/* Session-start "Continue your routine?" — actions row + Not-now button */
+/* Actions sit on their own row, centered, beneath the "Your routine" header. */
+.nt-routine-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+.nt-routine-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.nt-routine-no {
+  border: 0;
+  background: rgba(255, 255, 255, 0.28);
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 6px 13px;
+  border-radius: 999px;
+  cursor: pointer;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.35);
+  transition: background 0.14s ease;
+}
+.nt-routine-no:hover {
+  background: rgba(255, 255, 255, 0.42);
+}
+
+/* ── Per-site routine editor modal ───────────────────────────────────────── */
+.nt-modal-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(15, 20, 25, 0.42);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+  animation: nt-scrim-in 0.16s ease;
+}
+@keyframes nt-scrim-in { from { opacity: 0; } to { opacity: 1; } }
+.nt-modal {
+  width: 100%;
+  max-width: 460px;
+  background: #fff;
+  border-radius: 22px;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.4);
+  padding: 22px 22px 18px;
+  animation: nt-modal-in 0.24s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+@keyframes nt-modal-in {
+  from { opacity: 0; transform: translateY(10px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.nt-modal-head {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  margin-bottom: 18px;
+}
+.nt-modal-ico {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+}
+.nt-modal-title {
+  flex: 1;
+  font-size: 17px;
+  font-weight: 650;
+  color: #0f1114;
+}
+.nt-modal-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(120, 120, 128, 0.12);
+  color: rgba(60, 60, 67, 0.7);
+  cursor: pointer;
+  transition: background 0.14s ease;
+}
+.nt-modal-x:hover { background: rgba(120, 120, 128, 0.22); }
+.nt-modal-label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(0, 0, 0, 0.7);
+  margin-bottom: 8px;
+}
+.nt-modal-textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 96px;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  border-radius: 14px;
+  padding: 12px 14px;
+  font-size: 14.5px;
+  line-height: 1.5;
+  color: #0f1114;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+.nt-modal-textarea:focus { border-color: rgba(0, 0, 0, 0.42); }
+.nt-modal-hint {
+  font-size: 12px;
+  color: rgba(0, 0, 0, 0.42);
+  line-height: 1.45;
+  margin: 8px 2px 16px;
+}
+.nt-modal-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.nt-modal-foot-right {
+  display: inline-flex;
+  gap: 8px;
+}
+.nt-modal-open,
+.nt-modal-cancel,
+.nt-modal-save {
+  border: 0;
+  border-radius: 12px;
+  padding: 9px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.14s ease, background 0.14s ease;
+}
+.nt-modal-open {
+  background: rgba(120, 120, 128, 0.12);
+  color: #0f1114;
+}
+.nt-modal-cancel {
+  background: transparent;
+  color: rgba(60, 60, 67, 0.75);
+}
+.nt-modal-save {
+  background: #0a0a0a;
+  color: #fff;
+}
+.nt-modal-open:hover,
+.nt-modal-cancel:hover { background: rgba(120, 120, 128, 0.18); }
+.nt-modal-save:hover { transform: translateY(-1px); }
+
+/* Start-routine (agentic run) button + working note */
+.nt-routine-add,
+.nt-routine-run {
+  border: 0;
+  background: rgba(255, 255, 255, 0.94);
+  color: #0a0a0a;
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 999px;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16);
+  transition: transform 0.14s ease, background 0.14s ease;
+}
+.nt-routine-add:hover,
+.nt-routine-run:hover {
+  transform: translateY(-1px);
+  background: #fff;
+}
+.nt-routine-note {
+  margin: 12px auto 0;
+  max-width: 460px;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.92);
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.45);
+}
+
+/* Add-a-routine modal extras */
+.nt-modal-input {
+  width: 100%;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  border-radius: 12px;
+  padding: 10px 14px;
+  font-size: 14.5px;
+  color: #0f1114;
+  outline: none;
+  margin-bottom: 16px;
+  transition: border-color 0.15s ease;
+}
+.nt-modal-input:focus { border-color: rgba(0, 0, 0, 0.42); }
+.nt-modal-ico-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  background: #0a0a0a;
+  color: #fff;
+  flex-shrink: 0;
+}
+.nt-modal-ico-add svg {
+  display: block;
+}
+.nt-modal-save:disabled {
+  opacity: 0.35;
+  cursor: default;
+  transform: none;
+}
+
+/* ── Your profile ────────────────────────────────────────────────────────── */
+/* A quiet pill in the corner: who Tidra thinks you are. Everything behind it
+   is stored in this browser only — clicking opens settings to edit or clear. */
+.nt-profile-wrap {
+  position: fixed;
+  top: 18px;
+  right: 20px;
+  z-index: 4;
+}
+.nt-profile {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 14px 6px 6px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  /* Dark glass: the footage runs from bright sky to deep green, and only a
+     dark pill stays legible across all of it. */
+  background: rgba(12, 14, 17, 0.42);
+  backdrop-filter: blur(16px) saturate(1.3);
+  -webkit-backdrop-filter: blur(16px) saturate(1.3);
+  color: #fff;
+  cursor: pointer;
+  transition: background 0.25s ease, border-color 0.25s ease, transform 0.25s
+    cubic-bezier(0.22, 0.61, 0.36, 1), box-shadow 0.25s ease;
+}
+.nt-profile:hover {
+  background: rgba(12, 14, 17, 0.58);
+  border-color: rgba(255, 255, 255, 0.3);
+  transform: translateY(-1px);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.18);
+}
+.nt-profile:active {
+  transform: translateY(0) scale(0.99);
+}
+.nt-profile-av {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.9);
+  color: #0f1114;
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+.nt-profile-av-empty {
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+}
+.nt-profile-txt {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  line-height: 1.25;
+  max-width: 180px;
+}
+.nt-profile-txt b {
+  font-size: 13px;
+  font-weight: 600;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nt-profile-txt i {
+  font-style: normal;
+  font-size: 11.5px;
+  color: rgba(255, 255, 255, 0.66);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nt-profile-empty .nt-profile-txt b {
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.88);
+}
+@media (max-width: 620px) {
+  .nt-profile-txt {
+    display: none;
+  }
+  .nt-profile {
+    padding: 6px;
+  }
+}
+
+/* Profile card — what Tidra has on you, read-only. Editing happens in
+   settings, so there is exactly one place the data can change. */
+.nt-profile-catch {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+}
+.nt-profile-card {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  width: 320px;
+  max-width: calc(100vw - 40px);
+  padding: 16px;
+  border-radius: 20px;
+  border: 1px solid rgba(0, 0, 0, 0.07);
+  background: #fff;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.26);
+  text-align: left;
+  animation: nt-profile-pop 0.24s cubic-bezier(0.22, 0.61, 0.36, 1) backwards;
+}
+@keyframes nt-profile-pop {
+  from { opacity: 0; transform: translateY(-6px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+.nt-profile-card-head {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  margin-bottom: 14px;
+}
+.nt-profile-card-head .nt-profile-av {
+  width: 38px;
+  height: 38px;
+  font-size: 16px;
+  background: #0f1114;
+  color: #fff;
+}
+.nt-profile-av-flat {
+  background: rgba(0, 0, 0, 0.06) !important;
+  color: rgba(0, 0, 0, 0.5) !important;
+}
+.nt-profile-card-id {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.3;
+}
+.nt-profile-card-id b {
+  font-size: 15px;
+  font-weight: 600;
+  color: #0f1114;
+}
+.nt-profile-card-id i {
+  font-style: normal;
+  font-size: 12.5px;
+  color: rgba(0, 0, 0, 0.45);
+}
+/* Filled-in fields, label above value. */
+.nt-profile-fields {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.nt-profile-fields dt {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: rgba(0, 0, 0, 0.38);
+  margin-bottom: 1px;
+}
+.nt-profile-fields dd {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.4;
+  color: rgba(0, 0, 0, 0.75);
+  overflow-wrap: anywhere;
+}
+.nt-profile-fields:not(:empty) + section {
+  margin-top: 12px;
+}
+.nt-profile-body section + section {
+  margin-top: 12px;
+}
+.nt-profile-body h4 {
+  margin: 0 0 5px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: rgba(0, 0, 0, 0.38);
+}
+.nt-profile-body p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: rgba(0, 0, 0, 0.72);
+}
+.nt-profile-body ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.nt-profile-body li {
+  position: relative;
+  padding-left: 14px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: rgba(0, 0, 0, 0.72);
+}
+.nt-profile-body li::before {
+  content: '';
+  position: absolute;
+  left: 3px;
+  top: 8px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.28);
+}
+.nt-profile-blank {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: rgba(0, 0, 0, 0.55);
+}
+.nt-profile-note {
+  margin: 14px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid rgba(0, 0, 0, 0.07);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: rgba(0, 0, 0, 0.38);
+}
+.nt-profile-edit {
+  width: 100%;
+  margin-top: 12px;
+  padding: 10px;
+  border: 0;
+  border-radius: 13px;
+  background: #0a0a0a;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 560;
+  cursor: pointer;
+  transition: transform 0.25s cubic-bezier(0.22, 0.61, 0.36, 1), box-shadow 0.25s ease;
+}
+.nt-profile-edit:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.22);
+}
+.nt-profile-edit:active {
+  transform: translateY(0) scale(0.99);
+}
