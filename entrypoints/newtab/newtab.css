@@ -512,6 +512,30 @@ body {
   color: var(--nt-faint);
   cursor: pointer;
 }
+/* Mic — unmistakably red while the microphone is actually open. */
+.nt-mic-live {
+  color: #e5484d;
+  animation: nt-mic-pulse 1.4s ease-in-out infinite;
+}
+.nt-mic-busy {
+  opacity: 0.45;
+  cursor: default;
+}
+@keyframes nt-mic-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.14); opacity: 0.7; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nt-mic-live { animation: none; }
+}
+
+.nt-mic-note {
+  margin-top: 8px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--nt-faint);
+}
+
 .nt-send {
   display: inline-flex;
   align-items: center;

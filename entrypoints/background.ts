@@ -29,6 +29,7 @@ import {
   type Job,
   type JobItem,
 } from '../lib/jobs';
+import { parsePrintedConfirm } from '../lib/confirm';
 
 interface PageContext {
   title: string;
@@ -921,19 +922,15 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
     const confirmBlock = (response.content as any[]).find(
       (b) => b.type === 'tool_use' && b.name === 'confirm_action',
     );
-    // Weaker models sometimes *describe* the confirm tool instead of calling it,
-    // emitting "<confirm_action summary=... />" as plain text. That would leave
-    // the safety gate silently absent, so treat it as if the tool had been
-    // called: parse the summary out and stop the turn.
+    // Weaker models sometimes *describe* the confirm tool instead of calling
+    // it — as an XML-ish tag, or as a JSON blob of the call. Either way the
+    // Confirm bar would never appear and the safety checkpoint would silently
+    // not exist, which is the one failure this whole flow is here to prevent.
+    // So a printed confirmation is honoured exactly like a real tool call.
     if (!confirmBlock && response.stop_reason !== 'tool_use') {
       const said = extractText(response.content as ContentBlock[]);
-      const fake = /<\s*confirm[_\s]?action\b([^>]*)>/i.exec(said);
-      if (fake) {
-        const summary =
-          /summary\s*=\s*"([^"]+)"/i.exec(fake[1])?.[1] ||
-          said.replace(fake[0], '').trim() ||
-          'Ready. Do you want me to proceed?';
-        const label = /label\s*=\s*"([^"]+)"/i.exec(fake[1])?.[1] || 'Confirm';
+      const printed = parsePrintedConfirm(said);
+      if (printed) {
         if (autoMode) {
           messages.push({ role: 'assistant', content: said });
           messages.push({
@@ -942,8 +939,8 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
           });
           continue;
         }
-        await pushChat(said.replace(fake[0], '').trim() || summary, 'assistant');
-        await browser.storage.local.set({ tidraPending: { label } });
+        await pushChat(printed.summary, 'assistant');
+        await browser.storage.local.set({ tidraPending: { label: printed.label } });
         return;
       }
     }
@@ -1783,6 +1780,82 @@ async function handleJobControl(action: string): Promise<void> {
   }
 }
 
+// ─── Voice input ────────────────────────────────────────────────────────────
+// The island can't hold a microphone — it's a content script, so getUserMedia
+// there belongs to whatever site it's sitting on. The offscreen document does
+// the listening at the extension's own origin; this is just the relay.
+
+const OFFSCREEN_PATH = 'offscreen.html';
+let offscreenReady: Promise<void> | null = null;
+
+async function ensureOffscreen(): Promise<void> {
+  // Creating one twice throws, and the worker can restart at any time, so the
+  // in-flight promise is cached rather than a boolean.
+  if (offscreenReady) return offscreenReady;
+  offscreenReady = (async () => {
+    if (!(browser as any).offscreen) throw new Error('offscreen-unsupported');
+    const existing = await (browser.runtime as any).getContexts?.({
+      contextTypes: ['OFFSCREEN_DOCUMENT'],
+    });
+    if (existing?.length) return;
+    try {
+      await (browser as any).offscreen.createDocument({
+        url: OFFSCREEN_PATH,
+        reasons: ['USER_MEDIA'],
+        justification: 'Record the microphone so the user can talk to Tidra instead of typing.',
+      });
+    } catch (err) {
+      // A worker that restarted while the document survived lands here on
+      // browsers without getContexts. The document is what we wanted anyway.
+      if (!/single offscreen|already exists/i.test(String(err))) throw err;
+    }
+  })().catch((err) => {
+    offscreenReady = null; // let the next attempt try again
+    throw err;
+  });
+  return offscreenReady;
+}
+
+/**
+ * Which island asked to listen. The mic can close itself mid-sentence, long
+ * after the "start" call returned, so the result has to find its way back to
+ * the right island — and only that one. Islands on other tabs must not
+ * suddenly sprout someone else's words.
+ */
+let voiceSid: string | null = null;
+
+async function voiceRelay(action: string, sid?: string): Promise<any> {
+  if (action === 'start') voiceSid = sid ?? null;
+  await ensureOffscreen();
+  // createDocument resolves once the document exists, which is not the same as
+  // its module script having run and registered a listener. A message that
+  // arrives in that gap fails with "receiving end does not exist" — so give the
+  // page a moment and try again rather than reporting a broken microphone.
+  let lastErr: unknown;
+  for (let i = 0; i < 6; i++) {
+    try {
+      return await browser.runtime.sendMessage({ type: 'tidra-voice-offscreen', action });
+    } catch (err) {
+      lastErr = err;
+      if (!/receiving end|establish connection/i.test(String(err))) throw err;
+      await sleep(120);
+    }
+  }
+  throw lastErr;
+}
+
+/** Offscreen finished (or gave up). Publish it for the island that asked. */
+async function publishVoice(msg: { state?: string; text?: string; error?: string }): Promise<void> {
+  const sid = voiceSid;
+  await browser.storage.local.set({
+    tidraVoice: { sid, state: msg.state ?? 'idle', error: msg.error },
+    // Only stamp heard text when there is some — an empty result should leave
+    // the last thing the user said alone.
+    ...(msg.text ? { tidraHeard: { sid, text: msg.text, ts: Date.now() } } : {}),
+  });
+  if (msg.state === 'idle') voiceSid = null;
+}
+
 export default defineBackground(() => {
   // A worker that was killed mid-job comes back here. Anything left `doing` is
   // judged before a single new item starts.
@@ -1823,6 +1896,18 @@ export default defineBackground(() => {
         sendResponse({ route });
       })().catch(() => sendResponse({ route: 'chat' }));
       return true;
+    }
+    // Voice input: the island asks to listen. What it HEARD comes back later,
+    // through storage, because the mic usually closes itself.
+    if (message?.type === 'tidra-voice' && typeof message.action === 'string') {
+      voiceRelay(message.action, message.sid)
+        .then((res) => sendResponse(res ?? { ok: false, error: 'no-response' }))
+        .catch((err) => sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+      return true; // async response
+    }
+    if (message?.type === 'tidra-voice-result') {
+      publishVoice(message).catch(() => {});
+      return;
     }
     // Batch job controls from the island: start / approve / pause / resume /
     // cancel / dismiss.

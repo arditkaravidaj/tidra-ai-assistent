@@ -252,6 +252,21 @@ export function Island() {
   const [auto, setAuto] = useState(false);
   const [modeOpen, setModeOpen] = useState(false);
   const [files, setFiles] = useState<Attachment[]>([]);
+  // 'off' → idle, 'listening' → mic open, 'thinking' → Whisper has the clip.
+  const [mic, setMic] = useState<'off' | 'listening' | 'thinking'>('off');
+  // Mic trouble is shown as its own line. It must never be written into the
+  // composer: that overwrites what the user typed and reads like a message
+  // they are about to send.
+  const [micNote, setMicNote] = useState<{ text: string; fixable?: boolean } | null>(null);
+  /** Identifies this island's listening session — see toggleMic. */
+  const voiceSid = useRef<string | null>(null);
+  // Heard speech arrives through a storage listener registered once, so it
+  // would otherwise be stuck with the very first render's state. This keeps the
+  // send path pointed at the present.
+  const liveRef = useRef<{ input: string; ask: (p: string, i?: 'chat' | 'act') => void }>({
+    input: '',
+    ask: () => {},
+  });
   const fileRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -456,6 +471,33 @@ export function Island() {
       if (changes.tidraOpen) setOpen(!!changes.tidraOpen.newValue);
       if (changes.tidraPending) setPending((changes.tidraPending.newValue as Pending) ?? null);
       if (changes.tidraJob) setJob((changes.tidraJob.newValue as JobView) ?? null);
+      // The mic can close itself the moment you stop talking, so its state and
+      // its result both arrive here rather than as the reply to a click.
+      //
+      // The session id is read ONCE, up front, and both branches use that copy.
+      // Reading it per-branch is a trap: state and text land in the same
+      // storage write, the state branch runs first and ends the session, and
+      // the text that came with it is then thrown away as belonging to nobody.
+      const sid = voiceSid.current;
+      if (changes.tidraHeard && sid) {
+        const h = changes.tidraHeard.newValue as { sid?: string; text?: string } | undefined;
+        const heard = (h?.text ?? '').trim();
+        if (heard && h?.sid === sid) {
+          // Finishing the sentence is the send — saying something out loud and
+          // then having to press a button would defeat the point of speaking.
+          const typed = liveRef.current.input.trim();
+          setInput('');
+          liveRef.current.ask(typed ? `${typed} ${heard}` : heard);
+        }
+      }
+      if (changes.tidraVoice) {
+        const v = changes.tidraVoice.newValue as { sid?: string; state?: string; error?: string } | undefined;
+        if (v && v.sid === sid) {
+          setMic(v.state === 'listening' ? 'listening' : v.state === 'thinking' ? 'thinking' : 'off');
+          if (v.error) setMicNote(micError(v.error));
+          if (v.state === 'idle') voiceSid.current = null;
+        }
+      }
       if (changes.tidraUnread) setUnread(!!changes.tidraUnread.newValue);
     };
     browser.storage.onChanged.addListener(onChanged);
@@ -568,6 +610,10 @@ export function Island() {
       .catch(() => {});
   }
 
+  useEffect(() => {
+    liveRef.current = { input, ask };
+  });
+
   function confirmSend() {
     const label = pending?.label ?? 'Send';
     setPending(null);
@@ -604,6 +650,51 @@ export function Island() {
       }
     }
     if (picked.length) setFiles((prev) => [...prev, ...picked].slice(0, MAX_ATTACHMENTS));
+  }
+
+  // Talking to Tidra instead of typing. Click to listen, click again to send
+  // it to Whisper — the words land in the input so they can be edited before
+  // they go, rather than firing off a misheard sentence.
+  async function toggleMic() {
+    if (mic === 'thinking') return;
+    setMicNote(null);
+
+    if (mic === 'off') {
+      // A fresh id each time: the mic closes itself when you stop talking, and
+      // the words must come back to THIS island, not to one on another tab.
+      const sid = Math.random().toString(36).slice(2);
+      voiceSid.current = sid;
+      setMic('listening');
+      const res = await browser.runtime
+        .sendMessage({ type: 'tidra-voice', action: 'start', sid })
+        .catch(() => null);
+      if (!res?.ok) {
+        setMic('off');
+        voiceSid.current = null;
+        setMicNote(micError(res?.error));
+      }
+      return;
+    }
+
+    // Cutting it short by hand. The result still arrives via storage, same as
+    // if the pause had ended it — one path, not two.
+    setMic('thinking');
+    browser.runtime.sendMessage({ type: 'tidra-voice', action: 'stop' }).catch(() => {});
+  }
+
+  function micError(code?: string): { text: string; fixable?: boolean } {
+    // The permission case is the only one the user can act on from here, and
+    // it's the one everybody hits first — so it gets a button that goes
+    // straight to the one page where Chrome will actually ask.
+    if (code === 'mic-permission')
+      return { text: 'Tidra needs permission to use your microphone.', fixable: true };
+    if (code === 'no-microphone') return { text: 'No microphone found.' };
+    if (code === 'no-key') return { text: 'Add a Groq API key in settings to use voice.', fixable: true };
+    if (code === 'offscreen-unsupported')
+      return { text: "This browser won't let Tidra record here. Voice works on the Tidra new tab." };
+    // Anything else is shown verbatim rather than smoothed into "it failed" —
+    // an unreadable error at least says what to search for.
+    return { text: code ? `Voice failed — ${code}` : 'Voice failed, with no reason given.' };
   }
 
   function setMode(next: boolean) {
@@ -1043,6 +1134,26 @@ export function Island() {
         )}
       </div>
 
+      {micNote && (
+        <div className="tidra-micnote">
+          <span>{micNote.text}</span>
+          {micNote.fixable && (
+            <button
+              type="button"
+              onClick={() => {
+                openSettings();
+                setMicNote(null);
+              }}
+            >
+              Open settings
+            </button>
+          )}
+          <button type="button" className="tidra-micnote-x" onClick={() => setMicNote(null)} aria-label="Dismiss">
+            ✕
+          </button>
+        </div>
+      )}
+
       {renderJobBar()}
 
       {pending && (
@@ -1142,7 +1253,18 @@ export function Island() {
         >
           <IconPlus />
         </button>
-        <button className="tidra-input-icon" title="Voice (coming soon)" tabIndex={-1}>
+        <button
+          type="button"
+          className={
+            'tidra-input-icon' +
+            (mic === 'listening' ? ' tidra-mic-live' : '') +
+            (mic === 'thinking' ? ' tidra-mic-busy' : '')
+          }
+          onClick={toggleMic}
+          title={mic === 'listening' ? 'Stop and send what you said' : 'Speak instead of typing'}
+          aria-label={mic === 'listening' ? 'Stop listening' : 'Speak to Tidra'}
+          aria-pressed={mic === 'listening'}
+        >
           <IconMic />
         </button>
         {chat.loading ? (

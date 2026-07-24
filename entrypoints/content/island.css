@@ -665,6 +665,67 @@
   cursor: default;
 }
 
+/* Mic trouble — its own line above the composer. Never inside the input:
+   that would clobber what the user typed and look like an outgoing message. */
+.tidra-micnote {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 14px 8px;
+  padding: 10px 12px;
+  background: rgba(229, 72, 77, 0.1);
+  border-radius: 14px;
+  font-size: 13px;
+  line-height: 1.35;
+  color: #93242a;
+}
+
+.tidra-micnote > span {
+  flex: 1;
+}
+
+.tidra-micnote button {
+  flex-shrink: 0;
+  border: none;
+  border-radius: 10px;
+  padding: 6px 10px;
+  background: rgba(229, 72, 77, 0.16);
+  color: #93242a;
+  font-size: 12.5px;
+  font-weight: 590;
+  cursor: pointer;
+}
+
+.tidra-micnote button:hover {
+  background: rgba(229, 72, 77, 0.24);
+}
+
+.tidra-micnote-x {
+  padding: 6px 8px !important;
+  background: none !important;
+}
+
+/* Mic — red and pulsing while it listens, so there is never a doubt about
+   whether the microphone is open. */
+.tidra-mic-live {
+  color: #e5484d !important;
+  animation: tidra-mic-pulse 1.4s ease-in-out infinite;
+}
+
+.tidra-mic-busy {
+  opacity: 0.5;
+  cursor: default;
+}
+
+@keyframes tidra-mic-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.14); opacity: 0.75; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tidra-mic-live { animation: none; }
+}
+
 /* Batch job strip — a long run is the one thing that outlives a turn, so it
    gets a persistent home above the composer rather than a chat message. */
 .tidra-job {

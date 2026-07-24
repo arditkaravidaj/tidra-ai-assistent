@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import ReactDOM from 'react-dom/client';
 import { streamText, tierFor } from '../../lib/llm';
+import { record, transcribe, type Recorder } from '../../lib/voice';
 import { Wordmark } from '../../components/Wordmark';
 
 // Minimal inline markdown → JSX: **bold**, *italic*/_italic_, `code`.
@@ -351,9 +352,16 @@ function NewTab() {
   const [routineStarted, setRoutineStarted] = useState(false);
   const [profile, setProfile] = useState<NtProfile>({});
   const [profileOpen, setProfileOpen] = useState(false);
+  const [mic, setMic] = useState<'off' | 'listening' | 'thinking'>('off');
+  const [micNote, setMicNote] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const threadRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const recorderRef = useRef<Recorder | null>(null);
+  // The mic can close itself long after it was opened, so the auto-send path
+  // runs from a callback captured back then. These refs keep it looking at the
+  // present rather than at whatever was on screen when recording started.
+  const liveRef = useRef({ input: '', streaming: false });
   const suggestSeq = useRef(0);
 
   useEffect(() => {
@@ -715,6 +723,97 @@ function NewTab() {
   const curOpt = Math.min(activeOpt, Math.max(0, opts.length - 1));
   const primary = opts[0];
 
+  // Speak instead of type. This page is at the extension's own origin, so it
+  // records directly — and granting the microphone here is also what unlocks it
+  // for the island, which has to borrow the same grant via its offscreen page.
+  async function toggleMic() {
+    if (mic === 'thinking') return;
+    setMicNote(null);
+
+    if (mic === 'off') {
+      if (!apiKey) {
+        setMicNote('Add a Groq API key in settings to use voice.');
+        return;
+      }
+      try {
+        recorderRef.current = await record({
+          // Stops on its own when you stop talking — the button is the override.
+          onDone: (clip, reason) => {
+            recorderRef.current = null;
+            void useClip(clip, reason === 'no-speech');
+          },
+        });
+        setMic('listening');
+      } catch (err) {
+        const name = (err as { name?: string })?.name;
+        setMicNote(
+          name === 'NotAllowedError'
+            ? 'Microphone blocked. Allow it for this page in the address bar, then try again.'
+            : name === 'NotFoundError'
+              ? 'No microphone found.'
+              : 'Could not start the microphone.',
+        );
+      }
+      return;
+    }
+
+    const rec = recorderRef.current;
+    recorderRef.current = null;
+    await useClip((await rec?.stop()) ?? null);
+  }
+
+  /** Whichever way the recording ended, the clip goes through here. */
+  async function useClip(clip: Blob | null, silent = false) {
+    setMic('thinking');
+    try {
+      // Under ~1 KB is a click, not a sentence — don't pay to transcribe silence.
+      if (!clip || clip.size < 1200) {
+        if (silent) setMicNote("Didn't catch anything — try again.");
+        return;
+      }
+      const heard = (await transcribe(apiKey!, clip)).trim();
+      if (!heard) return;
+      // Whatever was already typed keeps its place in front of what was said.
+      const typed = liveRef.current.input.trim();
+      const said = typed ? `${typed} ${heard}` : heard;
+      setInput(said);
+      inputRef.current?.focus();
+      // Finishing the sentence IS the send. Nobody says a thing out loud and
+      // then reaches for the keyboard to confirm they meant it.
+      //
+      // Speech goes to Tidra, never to Google — talking to something is
+      // addressing it. A dictated web address is the one sensible exception,
+      // since "open github.com" out loud plainly means go there.
+      const url = asUrl(said);
+      if (url) go(url);
+      else runChat(said);
+    } catch (err) {
+      setMicNote(err instanceof Error ? err.message : 'Could not transcribe that.');
+    } finally {
+      setMic('off');
+    }
+  }
+
+  useEffect(() => {
+    liveRef.current = { input, streaming };
+  });
+
+  // Never leave the mic light on if the page goes away mid-recording.
+  useEffect(() => () => recorderRef.current?.cancel(), []);
+
+  const micButton = (
+    <button
+      type="button"
+      className={'nt-icon' + (mic === 'listening' ? ' nt-mic-live' : '') + (mic === 'thinking' ? ' nt-mic-busy' : '')}
+      onClick={toggleMic}
+      title={mic === 'listening' ? 'Stop and use what you said' : 'Speak instead of typing'}
+      aria-label={mic === 'listening' ? 'Stop listening' : 'Speak'}
+      aria-pressed={mic === 'listening'}
+    >
+      <IconMic />
+    </button>
+  );
+
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === 'Enter' && e.shiftKey && !e.metaKey) return; // Shift+Enter = newline
     if (!showDrop) {
@@ -934,11 +1033,10 @@ function NewTab() {
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={onKeyDown}
               />
-              <button className="nt-icon" title="Voice (coming soon)" tabIndex={-1}>
-                <IconMic />
-              </button>
+              {micButton}
               {sendBtn}
             </div>
+            {micNote && <div className="nt-mic-note">{micNote}</div>}
           </div>
         </>
       ) : (
@@ -1004,9 +1102,7 @@ function NewTab() {
                 <span>New tab</span>
               </button>
               <div className="nt-box-actions">
-                <button className="nt-icon" title="Voice (coming soon)" tabIndex={-1}>
-                  <IconMic />
-                </button>
+                {micButton}
                 {q && primary ? (
                   <button
                     className={'nt-go ' + (primary.kind === 'chat' ? 'nt-go-chat' : 'nt-go-google')}
@@ -1025,6 +1121,7 @@ function NewTab() {
               </div>
             </div>
             </div>
+            {micNote && <div className="nt-mic-note">{micNote}</div>}
           </div>
 
           {!q && (

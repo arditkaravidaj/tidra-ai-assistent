@@ -67,6 +67,36 @@ function Options() {
   const [saved, setSaved] = useState(false);
   // Clearing is irreversible, so both clears ask first.
   const [confirming, setConfirming] = useState<'profile' | 'routine' | null>(null);
+  const [micState, setMicState] = useState<'unknown' | 'granted' | 'denied' | 'asking'>('unknown');
+
+  // Chrome will only show a microphone prompt on a VISIBLE page at the
+  // extension's own origin. The island can't do it — it's a content script on
+  // someone else's site — and the offscreen document that actually records is
+  // invisible. So this page is where the grant has to happen, once. Everything
+  // else inherits it, because it's all the same origin.
+  useEffect(() => {
+    navigator.permissions
+      ?.query({ name: 'microphone' as PermissionName })
+      .then((p) => {
+        const read = () => setMicState(p.state === 'prompt' ? 'unknown' : (p.state as 'granted' | 'denied'));
+        read();
+        p.onchange = read;
+      })
+      .catch(() => {});
+  }, []);
+
+  async function allowMic() {
+    setMicState('asking');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // The grant is what was wanted, not the audio — let the mic go again
+      // immediately so no recording light stays on.
+      stream.getTracks().forEach((t) => t.stop());
+      setMicState('granted');
+    } catch {
+      setMicState('denied');
+    }
+  }
 
   useEffect(() => {
     browser.storage.local
@@ -226,6 +256,27 @@ function Options() {
           </label>
           <button type="button" className="routine-clear" onClick={() => setConfirming('routine')}>
             {cleared ? '✓ Cleared' : 'Clear routine data'}
+          </button>
+        </div>
+
+        <div className="routine-row" id="microphone">
+          <span className="routine-toggle">
+            <span>
+              <strong>Microphone</strong> —{' '}
+              {micState === 'granted'
+                ? 'allowed. You can talk to Tidra on any site.'
+                : micState === 'denied'
+                  ? 'blocked. Allow it for this page in the address bar, then reload.'
+                  : 'speak instead of typing. Allow it once here and it works everywhere.'}
+            </span>
+          </span>
+          <button
+            type="button"
+            className="routine-clear"
+            onClick={allowMic}
+            disabled={micState === 'granted' || micState === 'asking'}
+          >
+            {micState === 'granted' ? '✓ Allowed' : micState === 'asking' ? 'Asking…' : 'Allow microphone'}
           </button>
         </div>
 

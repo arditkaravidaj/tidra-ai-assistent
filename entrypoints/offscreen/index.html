@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Tidra voice</title>
+  </head>
+  <body>
+    <!-- Never shown. It exists because a content script cannot hold a
+         microphone: getUserMedia there runs against the host page's origin,
+         so it prompts on every new site and some sites forbid it outright.
+         This document runs at the extension's own origin, where the grant is
+         given once and holds everywhere. -->
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

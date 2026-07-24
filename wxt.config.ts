@@ -25,6 +25,9 @@ export default defineConfig({
       'webNavigation',
       'unlimitedStorage',
       'alarms',
+      // Voice input records in an offscreen document, because a content script
+      // would have to borrow the host page's microphone permission.
+      'offscreen',
     ],
     // <all_urls> is what the content script already matches; it additionally
     // lets the background enumerate frames and capture the tab for the vision
