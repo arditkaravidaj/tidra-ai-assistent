@@ -194,6 +194,8 @@
   width: auto;
   align-self: flex-start;
   color: #000;
+  /* Breathing room between the wordmark and the reply text below it. */
+  margin-bottom: 7px;
 }
 
 .tidra-card-text {
@@ -647,7 +649,7 @@
 .tidra-confirm-no {
   border: none;
   background: rgba(120, 120, 128, 0.16);
-  color: #3f9a1c;
+  color: #1c1c1e;
 }
 
 .tidra-confirm-yes {
@@ -1240,4 +1242,96 @@
   }
   .tidra-chip-doc { background: rgba(255, 255, 255, 0.16); color: rgba(235, 235, 245, 0.8); }
   .tidra-chip button { background: rgba(255, 255, 255, 0.14); color: rgba(235, 235, 245, 0.8); }
+}
+
+/* ── Slash skills menu — pops over the composer while typing "/name" ─────── */
+.tidra-slash {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 12px;
+  right: 12px;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+  max-height: 264px;
+  overflow-y: auto;
+  border-radius: 18px;
+  border: 0.5px solid rgba(0, 0, 0, 0.08);
+  background: #ffffff;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.22);
+  animation: tidra-mode-pop 0.18s cubic-bezier(0.22, 0.61, 0.36, 1) backwards;
+}
+.tidra-slash-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  border-radius: 12px;
+  padding: 8px 11px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.tidra-slash-item b {
+  flex-shrink: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #0f1114;
+}
+.tidra-slash-item i {
+  flex: 1;
+  min-width: 0;
+  font-style: normal;
+  font-size: 12px;
+  color: rgba(60, 60, 67, 0.6);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tidra-slash-badge {
+  flex-shrink: 0;
+  align-self: center;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(120, 120, 128, 0.14);
+  color: rgba(60, 60, 67, 0.7);
+}
+.tidra-slash-on {
+  background: rgba(120, 120, 128, 0.12);
+}
+.tidra-slash-foot {
+  padding: 5px 11px 3px;
+  font-size: 11px;
+  color: rgba(60, 60, 67, 0.45);
+  border-top: 0.5px solid rgba(0, 0, 0, 0.06);
+  margin-top: 2px;
+}
+@media (prefers-color-scheme: dark) {
+  .tidra-slash { background: #1c1c1e; border-color: rgba(255, 255, 255, 0.1); }
+  .tidra-slash-item b { color: #f2f2f7; }
+  .tidra-slash-item i { color: rgba(235, 235, 245, 0.6); }
+  .tidra-slash-on { background: rgba(255, 255, 255, 0.1); }
+  .tidra-slash-badge { background: rgba(255, 255, 255, 0.14); color: rgba(235, 235, 245, 0.7); }
+  .tidra-slash-foot { color: rgba(235, 235, 245, 0.4); border-color: rgba(255, 255, 255, 0.08); }
+}
+
+/* The "acts" badge in the slash menu matches the orange mode pills in settings. */
+.tidra-slash-badge {
+  background: #fff7ed;
+  border: 1px solid rgba(234, 88, 12, 0.45);
+  color: #ea580c;
+}
+@media (prefers-color-scheme: dark) {
+  .tidra-slash-badge {
+    background: rgba(234, 88, 12, 0.16);
+    border-color: rgba(234, 88, 12, 0.5);
+    color: #fb923c;
+  }
 }

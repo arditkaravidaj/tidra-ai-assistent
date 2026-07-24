@@ -462,3 +462,321 @@ button:disabled {
   margin: 10px 0 0;
   font-size: 11.5px;
 }
+
+/* ── Settings pages — picked in the header ───────────────────────────────── */
+.opt-tabs {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.05);
+}
+.opt-tab {
+  width: auto;
+  border: 0;
+  background: transparent;
+  color: rgba(0, 0, 0, 0.55);
+  border-radius: 999px;
+  padding: 7px 14px;
+  font-size: 13px;
+  font-weight: 560;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+.opt-tab:hover:not(.opt-tab-on) {
+  color: #000;
+  transform: none;
+}
+.opt-tab-on {
+  background: #0a0a0a;
+  color: #fff;
+}
+@media (max-width: 640px) {
+  .brand { flex-wrap: wrap; }
+  .opt-tabs { margin-left: 0; width: 100%; justify-content: space-between; }
+}
+
+/* ── Skills — the slash commands ─────────────────────────────────────────── */
+.skill-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.skill-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 14px;
+  background: #fff;
+}
+.skill-name {
+  flex-shrink: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #0f1114;
+  font-variant-ligatures: none;
+}
+.skill-desc {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  color: rgba(0, 0, 0, 0.45);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.skill-mode {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.06);
+  color: rgba(0, 0, 0, 0.55);
+}
+.skill-mode-act {
+  background: rgba(10, 10, 10, 0.9);
+  color: #fff;
+}
+.skill-btn {
+  flex-shrink: 0;
+  width: auto;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  background: #fff;
+  color: rgba(0, 0, 0, 0.7);
+  border-radius: 10px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.skill-btn:hover {
+  background: rgba(0, 0, 0, 0.045);
+}
+.skill-btn-x:hover {
+  border-color: rgba(215, 54, 47, 0.5);
+  color: #c22e28;
+  background: rgba(215, 54, 47, 0.05);
+}
+
+/* The editor card (edit an existing skill, or add a new one). */
+.skill-editor {
+  border: 1px solid rgba(0, 0, 0, 0.16);
+  border-radius: 16px;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.015);
+}
+.skill-editor-grid {
+  display: grid;
+  grid-template-columns: 1fr 1.6fr;
+  gap: 14px 16px;
+  margin-bottom: 14px;
+}
+@media (max-width: 640px) {
+  .skill-editor-grid { grid-template-columns: 1fr; }
+}
+.skill-prompt {
+  width: 100%;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 16px;
+  padding: 11px 14px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  outline: none;
+  resize: vertical;
+  background: #fff;
+  transition: border-color 0.15s ease;
+}
+.skill-prompt:focus {
+  border-color: rgba(0, 0, 0, 0.45);
+}
+.skill-modes {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+}
+.skill-mode-pick {
+  width: auto;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  background: #fff;
+  color: rgba(0, 0, 0, 0.65);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 12.5px;
+  font-weight: 560;
+}
+.skill-mode-on {
+  background: #0a0a0a;
+  border-color: #0a0a0a;
+  color: #fff;
+}
+.skill-mode-hint {
+  font-size: 11.5px;
+  color: rgba(0, 0, 0, 0.4);
+  margin-left: 4px;
+}
+.skill-editor-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+.skill-save {
+  width: auto;
+  border-radius: 12px;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 560;
+}
+.skill-save:hover:not(:disabled) {
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
+}
+.skill-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.skill-foot .routine-clear {
+  padding: 8px 14px;
+}
+.skill-note {
+  margin: 10px 0 0;
+}
+
+/* ── Fixed-size card ─────────────────────────────────────────────────────── */
+/* Every settings page lives in the same-size card; longer content scrolls
+   inside .opt-body instead of stretching the card per tab. */
+.card {
+  display: flex;
+  flex-direction: column;
+  height: min(680px, calc(100vh - 48px));
+}
+.opt-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* Breathing room so the scrollbar doesn't sit on the content. */
+  margin-right: -22px;
+  padding-right: 22px;
+  padding-bottom: 6px;
+}
+.opt-body::-webkit-scrollbar {
+  width: 8px;
+}
+.opt-body::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.16);
+  border-radius: 999px;
+}
+.opt-body::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.28);
+}
+.opt-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+.save {
+  flex-shrink: 0;
+  margin-top: 16px;
+}
+
+/* ── Routine sites in settings ───────────────────────────────────────────── */
+.rt-ico {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  flex-shrink: 0;
+  object-fit: contain;
+}
+.rt-name {
+  flex-shrink: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #0f1114;
+}
+.rt-domain {
+  font-size: 12px;
+  color: rgba(0, 0, 0, 0.4);
+}
+.rt-editor-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 12px;
+}
+
+/* Secondary buttons ("Allowed", "Clear …", Export/Import) — center the label
+   in the button box regardless of how tall the row makes it. */
+.routine-clear,
+.skill-btn,
+.skill-save {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  align-self: center;
+}
+
+/* Pinned footer toolbar (Skills page) — sits below the scroll area like Save. */
+.opt-footer {
+  flex-shrink: 0;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(0, 0, 0, 0.07);
+}
+.opt-footer .skill-note {
+  margin: 0 0 0 auto;
+}
+/* Small action button sitting right-aligned in a section header. */
+.head-btn {
+  margin-left: auto;
+}
+
+/* Microphone block — lives in the left column under the API key. */
+.mic-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding-top: 16px;
+  margin-top: 4px;
+  border-top: 1px solid rgba(0, 0, 0, 0.07);
+}
+.mic-row .routine-toggle {
+  flex: 1;
+  min-width: 200px;
+}
+.mic-hint {
+  width: 100%;
+  margin: 0;
+}
+
+/* Mode pills in orange — the CHAT/ACT badges and the Auto/Chat/Act picker. */
+.skill-mode {
+  background: #fff7ed;
+  border: 1px solid rgba(234, 88, 12, 0.45);
+  color: #ea580c;
+}
+.skill-mode-act {
+  background: #ea580c;
+  border-color: #ea580c;
+  color: #fff;
+}
+.skill-mode-pick {
+  border-color: rgba(234, 88, 12, 0.45);
+  background: #fff7ed;
+  color: #ea580c;
+}
+.skill-mode-pick:hover:not(.skill-mode-on) {
+  background: #ffedd5;
+}
+.skill-mode-on {
+  background: #ea580c;
+  border-color: #ea580c;
+  color: #fff;
+}

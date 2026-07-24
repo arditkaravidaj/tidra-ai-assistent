@@ -30,6 +30,8 @@ import {
   type JobItem,
 } from '../lib/jobs';
 import { parsePrintedConfirm } from '../lib/confirm';
+import { expandSkill, loadSkills, matchSkill } from '../lib/skills';
+import { defaultTaskFor, prettyDomain } from '../lib/routine';
 import { base64ToBlob, transcribe } from '../lib/voice';
 import { buildPdf, bytesToBase64, safeFilename, toWinAnsiText } from '../lib/pdf';
 import { extFromUrl, nameFromUrl, saveData, saveUrl } from '../lib/download';
@@ -388,29 +390,6 @@ interface Visit {
   t: number;
 }
 
-const KNOWN_NAMES: Record<string, string> = {
-  'mail.google.com': 'Gmail',
-  'calendar.google.com': 'Calendar',
-  'drive.google.com': 'Drive',
-  'www.linkedin.com': 'LinkedIn',
-  'linkedin.com': 'LinkedIn',
-  'www.youtube.com': 'YouTube',
-  'github.com': 'GitHub',
-  'x.com': 'X',
-  'twitter.com': 'X',
-  'web.whatsapp.com': 'WhatsApp',
-  'www.facebook.com': 'Facebook',
-  'www.notion.so': 'Notion',
-  'app.slack.com': 'Slack',
-};
-
-function prettyDomain(d: string): string {
-  if (KNOWN_NAMES[d]) return KNOWN_NAMES[d];
-  const parts = d.replace(/^www\./, '').split('.');
-  const name = parts.length >= 2 ? parts[parts.length - 2] : d;
-  return name.charAt(0).toUpperCase() + name.slice(1);
-}
-
 // Split the visit log into sessions and reduce each to its first distinct domains.
 function sessionStarts(visits: Visit[]): string[][] {
   const sorted = [...visits].sort((a, b) => a.t - b.t);
@@ -748,6 +727,22 @@ async function captureTab(tabId: number): Promise<string> {
 
 type ToolContent = string | (TextBlock | ImageBlock)[];
 
+/** Tidra's own working tab, for tasks that didn't start on a page — so the
+ * agent never takes over whatever tab the user happens to be looking at.
+ * The id lives in session storage: it survives the worker dying, and the tab
+ * is reused across turns instead of piling up blank tabs. */
+async function ensureAgentTab(): Promise<number | undefined> {
+  const { tidraAgentTab } = await browser.storage.session.get('tidraAgentTab');
+  if (typeof tidraAgentTab === 'number') {
+    const tab = await browser.tabs.get(tidraAgentTab).catch(() => null);
+    if (tab?.id != null) return tab.id;
+  }
+  const tab = await browser.tabs.create({ url: 'about:blank', active: false }).catch(() => null);
+  if (tab?.id == null) return undefined;
+  await browser.storage.session.set({ tidraAgentTab: tab.id });
+  return tab.id;
+}
+
 async function execTool(
   name: string,
   input: any,
@@ -763,6 +758,10 @@ async function execTool(
       isError: true,
     };
   }
+
+  // No working tab yet (the ask came from the new-tab chat): give the agent
+  // its own background tab rather than the one the user is looking at.
+  if (tabState.tabId == null) tabState.tabId = await ensureAgentTab();
   try {
     // Files are made here, not on the page: a generated PDF has no origin, and
     // a download does not care which tab is in front. Both run before the
@@ -843,7 +842,9 @@ async function execTool(
       let url: string = String(input.url || '');
       if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
       if (input.new_tab) {
-        const tab = await browser.tabs.create({ url, active: true });
+        // active:false — opening a tab must not yank the user away from
+        // whatever they are doing. They can click over to watch if they want.
+        const tab = await browser.tabs.create({ url, active: false });
         tabState.tabId = tab.id; // subsequent actions target the new tab
       } else {
         if (tabState.tabId == null) return { content: 'No active tab.', isError: true };
@@ -975,6 +976,22 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
     (m) => m.role !== 'error',
   );
 
+  // Slash skills: "/fact-check the stats" expands into the saved prompt before
+  // the model sees it. The chat keeps showing what the user typed; only the
+  // request that goes to the API is expanded. A skill's own mode (chat/act)
+  // outranks the router's guess — the user told us what this needs.
+  const lastUserText =
+    history.length && history[history.length - 1].role === 'user'
+      ? history[history.length - 1].text
+      : message.prompt;
+  let expandedPrompt: string | null = null;
+  let intent = message.intent;
+  const skillHit = matchSkill(lastUserText, await loadSkills());
+  if (skillHit) {
+    expandedPrompt = await expandSkill(skillHit.skill, skillHit.rest);
+    if (!intent && skillHit.skill.mode !== 'auto') intent = skillHit.skill.mode;
+  }
+
   const messages: Message[] = [];
   history.forEach((m, i) => {
     const isLastUser = i === history.length - 1 && m.role === 'user';
@@ -990,7 +1007,7 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
           message.page.text,
           ``,
           `---`,
-          `User request: ${m.text}`,
+          `User request: ${expandedPrompt ?? m.text}`,
         ].join('\n'),
       });
     } else {
@@ -999,16 +1016,17 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   });
   // Safety net: if history was empty for some reason, use the incoming prompt.
   if (messages.length === 0) {
-    messages.push({ role: 'user', content: message.prompt });
+    messages.push({ role: 'user', content: expandedPrompt ?? message.prompt });
   }
 
-  // The new-tab page may not report a sender tab, and without one every tool
-  // fails with "No working tab" — silently, since the new tab isn't rendering
-  // the agent's chat. Fall back to whatever tab is in front.
+  // Requests from the island act on the page they were asked from. Anything
+  // else (the new-tab chat, or a sender tab that isn't a real web page) gets
+  // Tidra's own background tab — created lazily by execTool — so the agent
+  // never borrows, or navigates away, a tab the user is working in.
   let workingTabId = senderTabId;
-  if (workingTabId == null) {
-    const [active] = await browser.tabs.query({ active: true, currentWindow: true });
-    workingTabId = active?.id;
+  if (workingTabId != null) {
+    const senderTab = await browser.tabs.get(workingTabId).catch(() => null);
+    if (!senderTab?.url || !/^https?:/i.test(senderTab.url)) workingTabId = undefined;
   }
   const tabState: TabState = { tabId: workingTabId };
   // The island sends "Confirmed — …" after the user presses the confirm button.
@@ -1029,14 +1047,22 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   try {
   // Repeated work over many targets can't run as one conversation — it becomes
   // a durable job instead. Only "act" requests are ever candidates.
-  if (message.intent !== 'chat' && (await maybeStartJob(apiKey, tier, message, abort.signal))) {
+  if (
+    intent !== 'chat' &&
+    (await maybeStartJob(
+      apiKey,
+      tier,
+      expandedPrompt ? { ...message, prompt: expandedPrompt } : message,
+      abort.signal,
+    ))
+  ) {
     await clearLoading();
     return;
   }
 
-  // Decide route: explicit hint (quick actions) or the cheap Haiku router.
+  // Decide route: explicit hint (quick actions, a skill's mode) or the cheap router.
   const route: 'chat' | 'act' =
-    message.intent ?? (await classify(apiKey, tier.router, message.prompt, history, abort.signal));
+    intent ?? (await classify(apiKey, tier.router, expandedPrompt ?? message.prompt, history, abort.signal));
 
   // Attachments ride on the newest user turn. Text files are inlined; images
   // become image blocks, which only the vision model can actually read.
@@ -1214,20 +1240,6 @@ HARD RULES:
 - Do not ask the user questions — do your best with what's on the page.
 - When finished, reply with a SHORT report: 1–3 sentences or a few bullets of what you found or drafted. No preamble.
 - Base everything strictly on the actual page content — never invent.`;
-
-const ROUTINE_TASK_DEFAULTS: Record<string, string> = {
-  'mail.google.com': 'Check for new important emails and draft replies I can review before sending.',
-  'linkedin.com': 'Check new messages and notifications, and summarize anything that needs a response.',
-  'github.com': 'Check my notifications and open pull requests, and summarize what needs my attention.',
-  'calendar.google.com': "Summarize today's meetings and what I should prepare.",
-  'x.com': 'Summarize the top posts from the people I follow.',
-  'twitter.com': 'Summarize the top posts from the people I follow.',
-  'notion.so': 'Summarize what changed in my workspace since I last checked.',
-  'www.youtube.com': 'List the new videos from channels I follow.',
-};
-function defaultTaskFor(domain: string): string {
-  return ROUTINE_TASK_DEFAULTS[domain] ?? "Look at this page and tell me what's new or needs my attention.";
-}
 
 async function getPageOf(tabId: number): Promise<PageContext> {
   const res = await sendAction(tabId, { type: 'tidra-action', action: 'get_page' });
@@ -1425,6 +1437,8 @@ const PLANNER_SYSTEM = `You split a user's request into a repeated unit of work,
 }
 
 batch is true only for genuinely repeated work over MULTIPLE targets (3 or more). A single multi-step task ("book a flight", "reply to this email") is NOT a batch — it is one item, so batch is false.
+
+batch is also false when the user only wants to FIND, look up, list, rank, compare, count or summarize things ("list the 3 best-selling sunglasses", "find 10 cheap flights", "show me 5 posts about X"). That is ONE research task whose ANSWER happens to be a list — there are no targets to work through, and nothing is missing. Batch means the user wants an action REPEATED on each target (message each person, reply to every email), not a numbered answer.
 
 source — where the list of targets comes from:
 - "attachment": the user attached a file holding the list (a CSV of recipients, etc).

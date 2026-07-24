@@ -2,6 +2,8 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import ReactDOM from 'react-dom/client';
 import { streamText, tierFor } from '../../lib/llm';
 import { record, transcribe, type Recorder } from '../../lib/voice';
+import { expandSkill, filterSkills, loadSkills, matchSkill, type Skill } from '../../lib/skills';
+import { defaultTaskFor, faviconUrl, prettyDomain } from '../../lib/routine';
 import { Wordmark } from '../../components/Wordmark';
 
 // Minimal inline markdown → JSX: **bold**, *italic*/_italic_, `code`.
@@ -36,29 +38,6 @@ Reply in the language the user writes in.`;
 // The local chat model emits this alone when a request turns out to need the
 // browser after all — a backstop for when the cheap router guessed wrong.
 const HANDOFF = 'NEEDS_BROWSER';
-
-// Pretty label for a domain, e.g. mail.google.com → Gmail, vercel.com → Vercel.
-const KNOWN: Record<string, string> = {
-  'mail.google.com': 'Gmail',
-  'calendar.google.com': 'Calendar',
-  'drive.google.com': 'Drive',
-  'www.linkedin.com': 'LinkedIn',
-  'linkedin.com': 'LinkedIn',
-  'www.youtube.com': 'YouTube',
-  'github.com': 'GitHub',
-  'x.com': 'X',
-  'twitter.com': 'X',
-  'web.whatsapp.com': 'WhatsApp',
-  'www.facebook.com': 'Facebook',
-  'www.notion.so': 'Notion',
-  'app.slack.com': 'Slack',
-};
-function prettyDomain(d: string): string {
-  if (KNOWN[d]) return KNOWN[d];
-  const parts = d.replace(/^www\./, '').split('.');
-  const name = parts.length >= 2 ? parts[parts.length - 2] : d;
-  return name.charAt(0).toUpperCase() + name.slice(1);
-}
 
 interface Visit {
   d: string;
@@ -242,6 +221,32 @@ const IconThumb = ({ down }: { down?: boolean }) => (
   </svg>
 );
 
+// Feather "settings" gear — same mark the island uses.
+const IconGear = () => (
+  <svg
+    width="17"
+    height="17"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <circle cx="12" cy="12" r="3" />
+    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+  </svg>
+);
+const IconBolt = () => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+    <path
+      d="M13 2 4.5 13.5H11L9.5 22 19 10.5h-6.5L13 2Z"
+      stroke="currentColor"
+      strokeWidth="1.7"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
 const IconChat = () => (
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
     <path
@@ -269,31 +274,6 @@ const IconChevron = () => (
     <path d="m6 9 6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
   </svg>
 );
-
-// Favicon from the browser's own cache (needs the "favicon" permission) — works
-// offline and isn't blocked by the extension page's CSP like a remote service is.
-function faviconUrl(pageUrl: string): string {
-  const base = (browser.runtime.getURL as unknown as (p: string) => string)('/_favicon/');
-  const u = new URL(base);
-  u.searchParams.set('pageUrl', pageUrl);
-  u.searchParams.set('size', '48');
-  return u.toString();
-}
-
-// A sensible starting description of what Tidra should do on a given site.
-const ROUTINE_TASK_DEFAULTS: Record<string, string> = {
-  'mail.google.com': 'Open Gmail, check for new important emails, and draft replies I can review before sending.',
-  'linkedin.com': 'Open LinkedIn, check new messages and notifications, and summarize anything that needs a response.',
-  'github.com': 'Open GitHub, check my notifications and open pull requests, and summarize what needs my attention.',
-  'calendar.google.com': "Open my calendar and summarize today's meetings and what I should prepare.",
-  'x.com': 'Open X and summarize the top posts from the people I follow.',
-  'twitter.com': 'Open X and summarize the top posts from the people I follow.',
-  'notion.so': 'Open Notion and summarize what changed in my workspace since I last checked.',
-  'www.youtube.com': 'Open YouTube and list the new videos from channels I follow.',
-};
-function defaultTask(domain: string, label: string): string {
-  return ROUTINE_TASK_DEFAULTS[domain] ?? `Open ${label} and tell me what's new since I last visited.`;
-}
 
 // One learned-routine site: grey card with the favicon + name. Clicking it opens
 // the routine editor; the ✕ removes it.
@@ -352,6 +332,7 @@ function NewTab() {
   const [routineStarted, setRoutineStarted] = useState(false);
   const [profile, setProfile] = useState<NtProfile>({});
   const [profileOpen, setProfileOpen] = useState(false);
+  const [skills, setSkills] = useState<Skill[]>([]);
   const [mic, setMic] = useState<'off' | 'listening' | 'thinking'>('off');
   const [micNote, setMicNote] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -401,6 +382,7 @@ function NewTab() {
     browser.storage.local.get('tidraProfile').then(({ tidraProfile }) => {
       if (tidraProfile && typeof tidraProfile === 'object') setProfile(tidraProfile as NtProfile);
     });
+    loadSkills().then(setSkills).catch(() => {});
   }, []);
 
   // The routine shown = learned sites + ones you added manually, de-duplicated.
@@ -420,7 +402,7 @@ function NewTab() {
     const site = routineSites.find((s) => s.domain === domain);
     setAddMode(false);
     setTaskDomain(domain);
-    setTaskDraft(tasks[domain] ?? defaultTask(domain, site?.label ?? domain));
+    setTaskDraft(tasks[domain] ?? defaultTaskFor(domain, site?.label ?? domain));
   }
   function saveTask() {
     if (!taskDomain) return;
@@ -511,7 +493,8 @@ function NewTab() {
   useEffect(() => {
     const q = input.trim();
     setActiveOpt(0);
-    if (!q || asUrl(q)) {
+    // No Google autocomplete for URLs or slash commands — nothing useful comes back.
+    if (!q || q.startsWith('/') || asUrl(q)) {
       setSuggestions([]);
       return;
     }
@@ -553,6 +536,12 @@ function NewTab() {
       return;
     }
 
+    // Slash skills: "/outline dutch golden age" expands into the skill's saved
+    // prompt. The thread shows what was typed; only the request sent to the
+    // model is expanded. An 'act' skill skips the router — it told us already.
+    const sk = matchSkill(text, skills);
+    const payload = sk ? await expandSkill(sk.skill, sk.rest) : text;
+
     setInput('');
     setSuggestions([]);
     const history = [...turns, { role: 'user' as const, text }];
@@ -562,12 +551,20 @@ function NewTab() {
     const abort = new AbortController();
     abortRef.current = abort;
     try {
+      if (sk?.skill.mode === 'act') {
+        await handOff(text); // the background expands the slash command itself
+        return;
+      }
+
       // The new tab has no tools of its own. If the request needs the browser,
       // hand it to the background agent — which drives THIS tab, so the island
       // picks the conversation up on whatever site it opens.
-      const routed = (await browser.runtime
-        .sendMessage({ type: 'tidra-route', prompt: text })
-        .catch(() => null)) as { route?: string } | null;
+      const routed =
+        sk?.skill.mode === 'chat'
+          ? null // the skill said chat — no need to ask the router
+          : ((await browser.runtime
+              .sendMessage({ type: 'tidra-route', prompt: payload })
+              .catch(() => null)) as { route?: string } | null);
 
       if (routed?.route === 'act') {
         await handOff(text);
@@ -583,7 +580,12 @@ function NewTab() {
           model: tierFor(tier).chat,
           max_tokens: 1024,
           system: SYSTEM,
-          messages: history.map((t) => ({ role: t.role, content: t.text })),
+          // The newest turn goes out expanded (if it was a skill); older turns
+          // ride along as they were typed.
+          messages: history.map((t, i) => ({
+            role: t.role,
+            content: i === history.length - 1 ? payload : t.text,
+          })),
         },
         (delta) => {
           acc += delta;
@@ -694,14 +696,30 @@ function NewTab() {
 
   interface Opt {
     key: string;
-    kind: 'google' | 'chat' | 'url';
+    kind: 'google' | 'chat' | 'url' | 'skill';
     label: string;
     sub?: string;
     hint?: string;
     run: () => void;
   }
   const opts: Opt[] = [];
-  if (q) {
+  // "/" invokes a skill — the dropdown becomes the skill picker. An unmatched
+  // slash query falls through to the ordinary Google/Chat options.
+  if (q.startsWith('/')) {
+    const sm = /^\/([a-z0-9-]*)(?:\s+([\s\S]*))?$/i.exec(q);
+    const nameQ = (sm?.[1] ?? '').toLowerCase();
+    const rest = (sm?.[2] ?? '').trim();
+    for (const s of filterSkills(nameQ, skills)) {
+      opts.push({
+        key: 'k' + s.name,
+        kind: 'skill',
+        label: '/' + s.name,
+        sub: s.description,
+        run: () => runChat('/' + s.name + (s.name === nameQ && rest ? ' ' + rest : '')),
+      });
+    }
+  }
+  if (q && !opts.length) {
     const googleOpt: Opt = { key: 'g', kind: 'google', label: q, sub: 'Google', hint: '⇧⌘⏎', run: () => runGoogle(q) };
     const chatOpt: Opt = { key: 'c', kind: 'chat', label: q, sub: 'Chat', hint: '⌃⌘⏎', run: () => runChat(q) };
     if (directUrl) {
@@ -965,6 +983,14 @@ function NewTab() {
               </div>
             </>
           )}
+          <button
+            className="nt-gear"
+            onClick={() => browser.runtime.sendMessage({ type: 'tidra-open-options' })}
+            title="Settings"
+            aria-label="Open Tidra settings"
+          >
+            <IconGear />
+          </button>
         </div>
       )}
 
@@ -1074,7 +1100,15 @@ function NewTab() {
                     }}
                   >
                     <span className="nt-sug-icon">
-                      {o.kind === 'chat' ? <IconChat /> : o.kind === 'url' ? <IconGlobe /> : <IconSearch />}
+                      {o.kind === 'skill' ? (
+                        <IconBolt />
+                      ) : o.kind === 'chat' ? (
+                        <IconChat />
+                      ) : o.kind === 'url' ? (
+                        <IconGlobe />
+                      ) : (
+                        <IconSearch />
+                      )}
                     </span>
                     <span className="nt-sug-text">
                       <span className="nt-sug-label">{o.label}</span>
@@ -1105,14 +1139,31 @@ function NewTab() {
                 {micButton}
                 {q && primary ? (
                   <button
-                    className={'nt-go ' + (primary.kind === 'chat' ? 'nt-go-chat' : 'nt-go-google')}
+                    className={
+                      'nt-go ' +
+                      (primary.kind === 'chat' || primary.kind === 'skill' ? 'nt-go-chat' : 'nt-go-google')
+                    }
                     onMouseDown={(e) => {
                       e.preventDefault();
                       primary.run();
                     }}
-                    aria-label={primary.kind === 'chat' ? 'Chat' : primary.kind === 'url' ? 'Open' : 'Google'}
+                    aria-label={
+                      primary.kind === 'skill'
+                        ? 'Run skill'
+                        : primary.kind === 'chat'
+                          ? 'Chat'
+                          : primary.kind === 'url'
+                            ? 'Open'
+                            : 'Google'
+                    }
                   >
-                    {primary.kind === 'chat' ? 'Chat' : primary.kind === 'url' ? 'Open' : 'Google'}
+                    {primary.kind === 'skill'
+                      ? 'Run'
+                      : primary.kind === 'chat'
+                        ? 'Chat'
+                        : primary.kind === 'url'
+                          ? 'Open'
+                          : 'Google'}
                     <IconEnter />
                   </button>
                 ) : (
@@ -1243,7 +1294,7 @@ function NewTab() {
               onChange={(e) => setTaskDraft(e.target.value)}
               placeholder={
                 taskSite
-                  ? `e.g. ${defaultTask(taskSite.domain, taskSite.label)}`
+                  ? `e.g. ${defaultTaskFor(taskSite.domain, taskSite.label)}`
                   : 'e.g. Check new emails and draft replies I can review before sending.'
               }
               autoFocus={!addMode}

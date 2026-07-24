@@ -1,7 +1,18 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import ReactDOM from 'react-dom/client';
 import { Wordmark } from '../../components/Wordmark';
 import { GROQ_MODELS } from '../../lib/llm';
+import {
+  DEFAULT_SKILLS,
+  exportSkills,
+  loadSkills,
+  mergeSkills,
+  normalizeName,
+  parseSkillsImport,
+  saveSkills,
+  type Skill,
+} from '../../lib/skills';
+import { defaultTaskFor, faviconUrl, prettyDomain } from '../../lib/routine';
 import '../content/font.css';
 import './options.css';
 
@@ -57,7 +68,31 @@ const FIELDS: { key: keyof Profile; label: string; placeholder: string }[] = [
   { key: 'languages', label: 'Languages', placeholder: 'e.g. English, German' },
 ];
 
+interface RoutineSite {
+  domain: string;
+  label: string;
+  url: string;
+}
+
+// Settings grew past one screen, so it's split into pages — picked in the header.
+type Tab = 'general' | 'profile' | 'skills' | 'routine';
+const TABS: { id: Tab; label: string }[] = [
+  { id: 'general', label: 'General' },
+  { id: 'profile', label: 'Profile' },
+  { id: 'skills', label: 'Skills' },
+  { id: 'routine', label: 'Routine' },
+];
+
+const EMPTY_DRAFT = { name: '', description: '', prompt: '', mode: 'auto' as Skill['mode'] };
+
+const MODES: { id: Skill['mode']; label: string; desc: string }[] = [
+  { id: 'auto', label: 'Auto', desc: 'Tidra decides whether it needs the browser' },
+  { id: 'chat', label: 'Chat', desc: 'Answer from the page text and what Tidra knows' },
+  { id: 'act', label: 'Act', desc: 'Use the browser agent — click, type, navigate' },
+];
+
 function Options() {
+  const [tab, setTab] = useState<Tab>('general');
   const [apiKey, setApiKey] = useState('');
   const [tier, setTier] = useState('balanced');
   const [routineOn, setRoutineOn] = useState(true);
@@ -68,6 +103,247 @@ function Options() {
   // Clearing is irreversible, so both clears ask first.
   const [confirming, setConfirming] = useState<'profile' | 'routine' | null>(null);
   const [micState, setMicState] = useState<'unknown' | 'granted' | 'denied' | 'asking'>('unknown');
+  const [micHint, setMicHint] = useState<string | null>(null);
+  // Skills — the slash commands. Saved to storage as you go, not via Save.
+  const [skills, setSkills] = useState<Skill[]>([]);
+  const [editing, setEditing] = useState<string | null>(null); // a skill id, or 'new'
+  const [draft, setDraft] = useState(EMPTY_DRAFT);
+  const [skillNote, setSkillNote] = useState<string | null>(null);
+  const importRef = useRef<HTMLInputElement>(null);
+  // Routine — the sites Tidra visits on "Start routine" and what it does on
+  // each. Learned sites come from the background; manual ones from storage.
+  const [rtLearned, setRtLearned] = useState<RoutineSite[]>([]);
+  const [rtManual, setRtManual] = useState<RoutineSite[]>([]);
+  const [rtTasks, setRtTasks] = useState<Record<string, string>>({});
+  const [rtEditing, setRtEditing] = useState<string | null>(null); // a domain
+  const [rtDraft, setRtDraft] = useState('');
+  const [rtAdding, setRtAdding] = useState(false);
+  const [rtAddUrl, setRtAddUrl] = useState('');
+
+  useEffect(() => {
+    loadSkills().then(setSkills).catch(() => {});
+    browser.runtime
+      .sendMessage({ type: 'tidra-get-routine' })
+      .then((res: { sites?: { domain: string; url: string }[] } | undefined) => {
+        if (res?.sites)
+          setRtLearned(
+            res.sites.map((s) => ({ domain: s.domain, label: prettyDomain(s.domain), url: s.url })),
+          );
+      })
+      .catch(() => {});
+    browser.storage.local
+      .get(['tidraRoutineManual', 'tidraRoutineTasks'])
+      .then(({ tidraRoutineManual, tidraRoutineTasks }) => {
+        if (Array.isArray(tidraRoutineManual)) setRtManual(tidraRoutineManual as RoutineSite[]);
+        if (tidraRoutineTasks && typeof tidraRoutineTasks === 'object')
+          setRtTasks(tidraRoutineTasks as Record<string, string>);
+      });
+  }, []);
+
+  // Learned + manually-added, de-duplicated — same list the new tab shows.
+  const rtSites: RoutineSite[] = (() => {
+    const seen = new Set<string>();
+    const out: RoutineSite[] = [];
+    for (const s of [...rtLearned, ...rtManual]) {
+      if (seen.has(s.domain)) continue;
+      seen.add(s.domain);
+      out.push(s);
+    }
+    return out;
+  })();
+
+  function rtTaskOf(s: RoutineSite): string {
+    return (rtTasks[s.domain] || defaultTaskFor(s.domain, s.label)).trim();
+  }
+
+  function rtSaveTask(domain: string) {
+    const next = { ...rtTasks, [domain]: rtDraft.trim() };
+    setRtTasks(next);
+    browser.storage.local.set({ tidraRoutineTasks: next });
+    setRtEditing(null);
+  }
+
+  // Remove a site from the routine — remembered so a learned one doesn't come back.
+  function rtRemove(domain: string) {
+    setRtLearned((prev) => prev.filter((s) => s.domain !== domain));
+    setRtManual((prev) => {
+      const next = prev.filter((s) => s.domain !== domain);
+      browser.storage.local.set({ tidraRoutineManual: next });
+      return next;
+    });
+    browser.storage.local.get('tidraRoutineHidden').then(({ tidraRoutineHidden }) => {
+      const hidden = new Set((tidraRoutineHidden as string[]) || []);
+      hidden.add(domain);
+      browser.storage.local.set({ tidraRoutineHidden: [...hidden] });
+    });
+    if (rtEditing === domain) setRtEditing(null);
+  }
+
+  function rtAdd() {
+    const raw = rtAddUrl.trim();
+    if (!raw) return;
+    let domain: string;
+    try {
+      domain = new URL(/^https?:\/\//i.test(raw) ? raw : 'https://' + raw).hostname.replace(/^www\./, '');
+    } catch {
+      return;
+    }
+    if (!domain.includes('.')) return;
+    const site: RoutineSite = { domain, label: prettyDomain(domain), url: 'https://' + domain };
+    setRtManual((prev) => {
+      const next = [...prev.filter((m) => m.domain !== domain), site];
+      browser.storage.local.set({ tidraRoutineManual: next });
+      return next;
+    });
+    if (rtDraft.trim()) {
+      const next = { ...rtTasks, [domain]: rtDraft.trim() };
+      setRtTasks(next);
+      browser.storage.local.set({ tidraRoutineTasks: next });
+    }
+    // Un-hide it if it had been removed before.
+    browser.storage.local.get('tidraRoutineHidden').then(({ tidraRoutineHidden }) => {
+      const hidden = new Set((tidraRoutineHidden as string[]) || []);
+      if (hidden.delete(domain)) browser.storage.local.set({ tidraRoutineHidden: [...hidden] });
+    });
+    setRtAdding(false);
+    setRtAddUrl('');
+    setRtDraft('');
+  }
+
+  function note(text: string) {
+    setSkillNote(text);
+    setTimeout(() => setSkillNote(null), 4000);
+  }
+
+  async function persistSkills(next: Skill[]) {
+    setSkills(next);
+    await saveSkills(next);
+  }
+
+  function startEdit(s: Skill) {
+    setEditing(s.id);
+    setDraft({ name: s.name, description: s.description, prompt: s.prompt, mode: s.mode });
+  }
+
+  function startNew() {
+    setEditing('new');
+    setDraft(EMPTY_DRAFT);
+  }
+
+  async function saveDraft() {
+    const name = normalizeName(draft.name);
+    if (!name) return note('Give the skill a name — letters, numbers and dashes.');
+    if (!draft.prompt.trim()) return note('The skill needs a prompt — that is what it does.');
+    if (skills.some((s) => s.name === name && s.id !== editing)) {
+      return note(`/${name} already exists — pick another name or edit that one.`);
+    }
+    const skill: Skill = {
+      id: name,
+      name,
+      description: draft.description.trim(),
+      prompt: draft.prompt.trim(),
+      mode: draft.mode,
+    };
+    const next =
+      editing === 'new'
+        ? [...skills, skill]
+        : skills.map((s) => (s.id === editing ? skill : s));
+    await persistSkills(next);
+    setEditing(null);
+  }
+
+  async function removeSkill(id: string) {
+    await persistSkills(skills.filter((s) => s.id !== id));
+    if (editing === id) setEditing(null);
+  }
+
+  function doExport() {
+    const blob = new Blob([exportSkills(skills)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'tidra-skills.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function doImport(file: File | undefined) {
+    if (!file) return;
+    try {
+      const imported = parseSkillsImport(await file.text());
+      await persistSkills(mergeSkills(skills, imported));
+      note(`Imported ${imported.length} skill${imported.length === 1 ? '' : 's'}.`);
+    } catch (err) {
+      note(err instanceof Error ? err.message : 'Could not import that file.');
+    }
+  }
+
+  async function restoreDefaults() {
+    // Puts the starter pack back without touching skills the user made.
+    await persistSkills(mergeSkills(skills, DEFAULT_SKILLS));
+    note('Starter skills restored.');
+  }
+
+  // One editor, used both for "edit this skill" and "add a new one".
+  function skillEditor(key: string) {
+    return (
+      <div className="skill-editor" key={key}>
+        <div className="skill-editor-grid">
+          <div>
+            <label htmlFor="sk-name">Name</label>
+            <input
+              id="sk-name"
+              value={draft.name}
+              placeholder="e.g. fact-check"
+              spellCheck={false}
+              autoFocus
+              onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+            />
+          </div>
+          <div>
+            <label htmlFor="sk-desc">Description</label>
+            <input
+              id="sk-desc"
+              value={draft.description}
+              placeholder="One line shown in the menu"
+              onChange={(e) => setDraft({ ...draft, description: e.target.value })}
+            />
+          </div>
+        </div>
+        <label htmlFor="sk-prompt">Prompt</label>
+        <textarea
+          id="sk-prompt"
+          className="skill-prompt"
+          rows={5}
+          value={draft.prompt}
+          placeholder={'What should Tidra do? Use {input} for whatever follows the command.'}
+          onChange={(e) => setDraft({ ...draft, prompt: e.target.value })}
+        />
+        <div className="skill-modes">
+          {MODES.map((m) => (
+            <button
+              key={m.id}
+              type="button"
+              className={'skill-mode-pick' + (draft.mode === m.id ? ' skill-mode-on' : '')}
+              title={m.desc}
+              onClick={() => setDraft({ ...draft, mode: m.id })}
+            >
+              {m.label}
+            </button>
+          ))}
+          <span className="skill-mode-hint">{MODES.find((m) => m.id === draft.mode)?.desc}</span>
+        </div>
+        <div className="skill-editor-foot">
+          <button type="button" className="routine-clear" onClick={() => setEditing(null)}>
+            Cancel
+          </button>
+          <button type="button" className="skill-save" onClick={saveDraft}>
+            Save skill
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   // Chrome will only show a microphone prompt on a VISIBLE page at the
   // extension's own origin. The island can't do it — it's a content script on
@@ -96,6 +372,22 @@ function Options() {
     } catch {
       setMicState('denied');
     }
+  }
+
+  // A page can ask for the microphone but can't give it back — revoking is the
+  // browser's job. So "Remove access" opens the browser's own site-settings
+  // page for Tidra, where the toggle lives. (The permission listener above
+  // notices the change and flips the row back on its own.)
+  function openMicSettings() {
+    browser.tabs
+      .create({
+        url: 'chrome://settings/content/siteDetails?site=' + encodeURIComponent(location.origin),
+      })
+      .catch(() =>
+        setMicHint(
+          "Your browser won't open that page from here — open its site settings for this page (the icon in the address bar) and set Microphone to Block.",
+        ),
+      );
   }
 
   useEffect(() => {
@@ -157,9 +449,28 @@ function Options() {
         <div className="brand">
           <Orb />
           <Wordmark className="brand-mark" />
+          <nav className="opt-tabs" aria-label="Settings pages">
+            {TABS.map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                className={'opt-tab' + (tab === t.id ? ' opt-tab-on' : '')}
+                aria-current={tab === t.id ? 'page' : undefined}
+                onClick={() => setTab(t.id)}
+              >
+                {t.label}
+              </button>
+            ))}
+          </nav>
         </div>
         <p className="sub">An assistant you won't dread opening.</p>
 
+        {/* Every page renders inside the same fixed-size card; anything longer
+            scrolls in here rather than stretching the card. */}
+        <div className="opt-body">
+
+        {tab === 'general' && (
+        <>
         <div className="grid">
           <section className="col">
             <label htmlFor="key">Groq API Key</label>
@@ -177,6 +488,34 @@ function Options() {
               </a>
               .
             </p>
+
+            <div className="mic-row">
+              <span className="routine-toggle">
+                <span>
+                  <strong>Microphone</strong> —{' '}
+                  {micState === 'granted'
+                    ? "allowed. You can talk to Tidra on any site. Don't want it? Remove access any time."
+                    : micState === 'denied'
+                      ? 'blocked. Allow it for this page in the address bar, then reload.'
+                      : 'speak instead of typing. Allow it once here and it works everywhere.'}
+                </span>
+              </span>
+              {micState === 'granted' ? (
+                <button type="button" className="routine-clear" onClick={openMicSettings}>
+                  Remove access
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="routine-clear"
+                  onClick={allowMic}
+                  disabled={micState === 'asking'}
+                >
+                  {micState === 'asking' ? 'Asking…' : 'Allow microphone'}
+                </button>
+              )}
+              {micHint && <p className="hint mic-hint">{micHint}</p>}
+            </div>
           </section>
 
           <section className="col">
@@ -201,6 +540,10 @@ function Options() {
           </section>
         </div>
 
+        </>
+        )}
+
+        {tab === 'profile' && (
         <div className="profile-row">
           <div className="section-head">
             <span>Your profile</span>
@@ -241,7 +584,48 @@ function Options() {
             </button>
           </div>
         </div>
+        )}
 
+        {tab === 'skills' && (
+        <div className="profile-row">
+          <div className="section-head">
+            <span>Skills</span>
+            <span className="optional">slash commands</span>
+          </div>
+          <p className="hint profile-hint">
+            A skill is a saved prompt with a name. Type <strong>/</strong> anywhere in Tidra to run
+            one — <strong>/summarize</strong>, <strong>/fact-check</strong>,{' '}
+            <strong>/draft-reply</strong>. Make your own, and share them as a file with the buttons
+            below. In a prompt, <strong>{'{input}'}</strong> stands for whatever you type after the
+            command. Changes here save immediately.
+          </p>
+
+          <div className="skill-list">
+            {editing === 'new' && skillEditor('new')}
+            {skills.map((s) =>
+              editing === s.id ? (
+                skillEditor(s.id)
+              ) : (
+                <div key={s.id} className="skill-row">
+                  <span className="skill-name">/{s.name}</span>
+                  <span className="skill-desc">{s.description || '—'}</span>
+                  <span className={'skill-mode skill-mode-' + s.mode}>{s.mode}</span>
+                  <button type="button" className="skill-btn" onClick={() => startEdit(s)}>
+                    Edit
+                  </button>
+                  <button type="button" className="skill-btn skill-btn-x" onClick={() => removeSkill(s.id)}>
+                    Delete
+                  </button>
+                </div>
+              ),
+            )}
+          </div>
+
+        </div>
+        )}
+
+        {tab === 'routine' && (
+        <>
         <div className="routine-row">
           <label className="routine-toggle">
             <input
@@ -259,30 +643,174 @@ function Options() {
           </button>
         </div>
 
-        <div className="routine-row" id="microphone">
-          <span className="routine-toggle">
-            <span>
-              <strong>Microphone</strong> —{' '}
-              {micState === 'granted'
-                ? 'allowed. You can talk to Tidra on any site.'
-                : micState === 'denied'
-                  ? 'blocked. Allow it for this page in the address bar, then reload.'
-                  : 'speak instead of typing. Allow it once here and it works everywhere.'}
+        <div className="profile-row">
+          <div className="section-head">
+            <span>Your routine</span>
+            <span className="optional">
+              {rtSites.length} site{rtSites.length === 1 ? '' : 's'}
             </span>
-          </span>
-          <button
-            type="button"
-            className="routine-clear"
-            onClick={allowMic}
-            disabled={micState === 'granted' || micState === 'asking'}
-          >
-            {micState === 'granted' ? '✓ Allowed' : micState === 'asking' ? 'Asking…' : 'Allow microphone'}
-          </button>
+            {!rtAdding && (
+              <button
+                type="button"
+                className="skill-btn head-btn"
+                onClick={() => {
+                  setRtEditing(null);
+                  setRtDraft('');
+                  setRtAdding(true);
+                }}
+              >
+                + Add site
+              </button>
+            )}
+          </div>
+          <p className="hint profile-hint">
+            When you press <strong>Start routine</strong> on the new tab, Tidra opens each of these
+            sites in the background and does what its task says — drafting only, never sending.
+            Changes here save immediately.
+          </p>
+
+          {rtSites.length === 0 && !rtAdding && (
+            <p className="hint">
+              No routine yet — Tidra learns your usual sites as you browse, or add one below.
+            </p>
+          )}
+
+          <div className="skill-list">
+            {rtAdding && (
+              <div className="skill-editor">
+                <div className="skill-editor-grid">
+                  <div>
+                    <label htmlFor="rt-add-url">Website</label>
+                    <input
+                      id="rt-add-url"
+                      value={rtAddUrl}
+                      placeholder="e.g. gmail.com or notion.so"
+                      spellCheck={false}
+                      autoFocus
+                      onChange={(e) => setRtAddUrl(e.target.value)}
+                    />
+                  </div>
+                </div>
+                <label htmlFor="rt-add-task">What should Tidra do here?</label>
+                <textarea
+                  id="rt-add-task"
+                  className="skill-prompt"
+                  rows={3}
+                  value={rtDraft}
+                  placeholder="e.g. Check new emails and draft replies I can review before sending."
+                  onChange={(e) => setRtDraft(e.target.value)}
+                />
+                <div className="skill-editor-foot">
+                  <button
+                    type="button"
+                    className="routine-clear"
+                    onClick={() => {
+                      setRtAdding(false);
+                      setRtDraft('');
+                    }}
+                  >
+                    Cancel
+                  </button>
+                  <button type="button" className="skill-save" onClick={rtAdd} disabled={!rtAddUrl.trim()}>
+                    Add site
+                  </button>
+                </div>
+              </div>
+            )}
+            {rtSites.map((s) =>
+              rtEditing === s.domain ? (
+                <div className="skill-editor" key={s.domain}>
+                  <div className="rt-editor-head">
+                    <img className="rt-ico" src={faviconUrl(s.url)} alt="" />
+                    <span className="rt-name">{s.label}</span>
+                    <span className="rt-domain">{s.domain}</span>
+                  </div>
+                  <label htmlFor="rt-task">What should Tidra do here?</label>
+                  <textarea
+                    id="rt-task"
+                    className="skill-prompt"
+                    rows={3}
+                    value={rtDraft}
+                    autoFocus
+                    placeholder={defaultTaskFor(s.domain, s.label)}
+                    onChange={(e) => setRtDraft(e.target.value)}
+                  />
+                  <div className="skill-editor-foot">
+                    <button type="button" className="routine-clear" onClick={() => setRtEditing(null)}>
+                      Cancel
+                    </button>
+                    <button type="button" className="skill-save" onClick={() => rtSaveTask(s.domain)}>
+                      Save task
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="skill-row" key={s.domain}>
+                  <img className="rt-ico" src={faviconUrl(s.url)} alt="" />
+                  <span className="rt-name">{s.label}</span>
+                  <span className="skill-desc" title={rtTaskOf(s)}>
+                    {rtTaskOf(s)}
+                  </span>
+                  {!rtTasks[s.domain]?.trim() && <span className="skill-mode">default</span>}
+                  <button
+                    type="button"
+                    className="skill-btn"
+                    onClick={() => {
+                      setRtAdding(false);
+                      setRtEditing(s.domain);
+                      setRtDraft(rtTaskOf(s));
+                    }}
+                  >
+                    Edit
+                  </button>
+                  <button type="button" className="skill-btn skill-btn-x" onClick={() => rtRemove(s.domain)}>
+                    Remove
+                  </button>
+                </div>
+              ),
+            )}
+
+          </div>
+
+        </div>
+        </>
+        )}
+
         </div>
 
-        <button className="save" onClick={save} disabled={!apiKey.trim()}>
-          {saved ? '✓ Saved' : 'Save'}
-        </button>
+        {/* The footer is pinned below the scroll area, so the page's actions
+            are always in reach: the skills toolbar there, Save everywhere else. */}
+        {tab === 'skills' ? (
+          <div className="skill-foot opt-footer">
+            <button type="button" className="skill-save" onClick={startNew} disabled={editing === 'new'}>
+              + Add skill
+            </button>
+            <button type="button" className="routine-clear" onClick={doExport} disabled={!skills.length}>
+              Export
+            </button>
+            <button type="button" className="routine-clear" onClick={() => importRef.current?.click()}>
+              Import
+            </button>
+            <button type="button" className="routine-clear" onClick={restoreDefaults}>
+              Restore starter pack
+            </button>
+            <input
+              ref={importRef}
+              type="file"
+              accept="application/json,.json"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                void doImport(e.target.files?.[0]);
+                e.target.value = '';
+              }}
+            />
+            {skillNote && <span className="hint skill-note">{skillNote}</span>}
+          </div>
+        ) : (
+          <button className="save" onClick={save} disabled={!apiKey.trim()}>
+            {saved ? '✓ Saved' : 'Save'}
+          </button>
+        )}
       </div>
 
       {/* Neither clear can be undone — always ask first. */}

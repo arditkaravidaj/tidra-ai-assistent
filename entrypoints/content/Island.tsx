@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Wordmark } from '../../components/Wordmark';
 import { blobToBase64, record, type Recorder } from '../../lib/voice';
+import { filterSkills, loadSkills, type Skill } from '../../lib/skills';
 
 // Minimal inline markdown → JSX: **bold**, *italic*/_italic_, `code`.
 // Newlines are preserved by CSS (white-space: pre-wrap); emoji pass through.
@@ -253,6 +254,10 @@ export function Island() {
   const [auto, setAuto] = useState(false);
   const [modeOpen, setModeOpen] = useState(false);
   const [files, setFiles] = useState<Attachment[]>([]);
+  // Slash skills: the saved commands ("/summarize", "/fact-check") offered as
+  // an autocomplete menu while the input starts with "/".
+  const [skills, setSkills] = useState<Skill[]>([]);
+  const [slashIdx, setSlashIdx] = useState(0);
   // 'off' → idle, 'listening' → mic open, 'thinking' → Whisper has the clip.
   const [mic, setMic] = useState<'off' | 'listening' | 'thinking'>('off');
   // Mic trouble is shown as its own line. It must never be written into the
@@ -440,6 +445,7 @@ export function Island() {
 
   // Restore persisted state (survives navigation) + subscribe to changes
   useEffect(() => {
+    loadSkills().then(setSkills).catch(() => {});
     browser.storage.local
       .get([
         'tidraOpen',
@@ -502,6 +508,10 @@ export function Island() {
         }
       }
       if (changes.tidraUnread) setUnread(!!changes.tidraUnread.newValue);
+      // Skills edited in settings show up here without a reload.
+      if (changes.tidraSkills && Array.isArray(changes.tidraSkills.newValue)) {
+        setSkills(changes.tidraSkills.newValue as Skill[]);
+      }
     };
     browser.storage.onChanged.addListener(onChanged);
     return () => browser.storage.onChanged.removeListener(onChanged);
@@ -843,7 +853,46 @@ export function Island() {
     setReactions((prev) => ({ ...prev, [i]: prev[i] === r ? undefined : r }));
   }
 
+  // The slash menu is open while the input is still a bare "/name" — the
+  // moment a space or argument follows, it gets out of the way.
+  const slashTyped = /^\/([a-z0-9-]*)$/i.exec(input)?.[1] ?? null;
+  const slashList = slashTyped !== null ? filterSkills(slashTyped, skills) : [];
+  const slashOpen = slashList.length > 0 && !chat.loading;
+  const slashSel = Math.min(slashIdx, Math.max(0, slashList.length - 1));
+
+  function completeSlash(s: Skill) {
+    setInput('/' + s.name + ' ');
+    setSlashIdx(0);
+    inputRef.current?.focus();
+  }
+
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (slashOpen) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setSlashIdx((i) => Math.min(i + 1, slashList.length - 1));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setSlashIdx((i) => Math.max(i - 1, 0));
+        return;
+      }
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        completeSlash(slashList[slashSel]);
+        return;
+      }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        // A fully-typed command sends; a partial one completes first, so Enter
+        // never fires a skill the user was still choosing.
+        const sel = slashList[slashSel];
+        if (sel.name === slashTyped!.toLowerCase()) ask(input);
+        else completeSlash(sel);
+        return;
+      }
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       ask(input);
@@ -1302,6 +1351,29 @@ export function Island() {
       )}
 
       <div className="tidra-inputbar">
+        {slashOpen && (
+          <div className="tidra-slash" role="listbox" aria-label="Skills">
+            {slashList.map((s, i) => (
+              <button
+                key={s.id}
+                type="button"
+                role="option"
+                aria-selected={i === slashSel}
+                className={'tidra-slash-item' + (i === slashSel ? ' tidra-slash-on' : '')}
+                onMouseEnter={() => setSlashIdx(i)}
+                onMouseDown={(e) => {
+                  e.preventDefault(); // keep the textarea focused
+                  completeSlash(s);
+                }}
+              >
+                <b>/{s.name}</b>
+                <i>{s.description}</i>
+                {s.mode === 'act' && <span className="tidra-slash-badge">acts</span>}
+              </button>
+            ))}
+            <div className="tidra-slash-foot">Skills — create your own in settings</div>
+          </div>
+        )}
         {modeOpen && (
           <>
             <div className="tidra-mode-catch" onMouseDown={() => setModeOpen(false)} />
@@ -1329,8 +1401,11 @@ export function Island() {
           ref={inputRef}
           value={input}
           rows={1}
-          placeholder="Ask another question…"
-          onChange={(e) => setInput(e.target.value)}
+          placeholder="Ask anything — “/” for skills…"
+          onChange={(e) => {
+            setInput(e.target.value);
+            setSlashIdx(0);
+          }}
           onKeyDown={onKeyDown}
         />
         <button
