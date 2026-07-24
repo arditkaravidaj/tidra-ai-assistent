@@ -29,6 +29,7 @@ import {
   type Job,
   type JobItem,
 } from '../lib/jobs';
+import { cdpAvailable, cdpClick, cdpDetachAll } from '../lib/cdp';
 import { parsePrintedConfirm } from '../lib/confirm';
 import { expandSkill, loadSkills, matchSkill } from '../lib/skills';
 import { defaultTaskFor, prettyDomain } from '../lib/routine';
@@ -90,7 +91,7 @@ How you see and touch a page:
     textbox "Message Body" [ref_0-11]
   Act on refs — click(ref_0-4), fill(ref_0-11, "…") — never guess at labels.
 - Refs go stale the moment the page changes. After any click that opens, navigates or re-renders, take a fresh snapshot before acting again. If a tool says a ref is stale, snapshot and retry.
-- Every action tells you what changed ("new on screen: …"). Read it. "No visible change" means it didn't work — try a different element rather than continuing as if it succeeded.
+- Every action tells you what changed ("new on screen: …"). Read it. A click that changes nothing is automatically retried as a trusted OS-level click; if the result still says "no visible change", it didn't work — try a different element rather than continuing as if it succeeded.
 - Elements marked "offscreen" need scroll() first. Lists that load more as you scroll need scroll(direction:"down") then a fresh snapshot.
 - Sub-frames appear as FRAME sections with their own refs; use them exactly like the main page's.
 - go_back() returns to the previous page — use it to get back to a list of results after opening one item, instead of re-navigating from scratch.
@@ -103,7 +104,9 @@ Tools:
 - snapshot(): the interactive tree described above. Your default way of looking at a page.
 - click(ref) / fill(ref, text, submit) / select(ref, option) / scroll(ref | direction, amount).
 - get_page(): the page's visible TEXT — for reading and understanding content (an email thread, an article), not for finding things to click.
-- screenshot(): a picture of the page. Expensive — only when the snapshot genuinely isn't enough (canvas, custom widgets) or an action failed twice and you need to see why.
+- find(query): cheap semantic lookup — describe what you need ("the reply button under the second post") and get back just the matching elements with FRESH refs. Prefer it over a second full snapshot when you know what you're looking for. Refs from earlier snapshots go stale when you call it.
+- screenshot(question): a picture of the page, answered in text — what it shows, plus pixel coordinates for anything worth clicking. Expensive — only when the snapshot genuinely isn't enough (canvas, custom widgets, layout questions) or an action failed twice and you need to see why.
+- click_at(x, y): trusted click at pixel coordinates from the latest screenshot — the way to press things that have no ref (canvas apps, custom widgets). Always screenshot first; never guess coordinates.
 - click_text(text) / type_text(text, field, submit): label-matching fallbacks for when a full snapshot isn't worth it.
 
 Documents — reports and files:
@@ -216,8 +219,39 @@ const TOOLS: Tool[] = [
   {
     name: 'screenshot',
     description:
-      "Take a picture of the visible part of the page. Use ONLY when the snapshot isn't enough — canvas apps, custom drop-downs, or when an action failed twice and you need to see why. Costs far more than a snapshot. Only works on the tab in front.",
-    input_schema: { type: 'object', properties: {} },
+      "Look at the visible part of the page as an image and get a text answer: what it shows, with pixel coordinates for anything clickable, usable with click_at. Use ONLY when the snapshot isn't enough — canvas apps, custom drop-downs, layout questions, or when an action failed twice and you need to see why. Costs far more than a snapshot. Only works on the tab in front.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        question: {
+          type: 'string',
+          description: 'What you need to know from the image, e.g. "where is the Send button?" or "what does the chart show?"',
+        },
+      },
+    },
+  },
+  {
+    name: 'find',
+    description:
+      'Find elements on the current page by meaning — "the reply button under the second post", "the search box". Returns only the matching elements, with fresh refs for click/fill. Far cheaper than a full snapshot when you know what you need. Refs from earlier snapshots become stale.',
+    input_schema: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'What you are looking for, in plain words' } },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'click_at',
+    description:
+      'Trusted click at exact pixel coordinates from the LATEST screenshot — for things the snapshot has no ref for (canvas apps, custom widgets). Take a screenshot first and use the coordinates it reports; never guess.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        x: { type: 'number', description: 'Horizontal position in screenshot pixels' },
+        y: { type: 'number', description: 'Vertical position in screenshot pixels' },
+      },
+      required: ['x', 'y'],
+    },
   },
   {
     name: 'get_page',
@@ -517,7 +551,9 @@ function setStatus(text: string | null) {
 // Which results were snapshots is tracked in a Set of tool_use ids, NOT as a
 // field on the block — anything added to a block is sent to the API verbatim,
 // and an unknown field is a 400.
-const SNAPSHOT_TOOLS = new Set(['snapshot', 'list_actions', 'open_url', 'go_back', 'screenshot']);
+// find is here because it takes a fresh snapshot internally — its result is
+// small, but every ref issued before it is stale afterwards.
+const SNAPSHOT_TOOLS = new Set(['snapshot', 'list_actions', 'open_url', 'go_back', 'screenshot', 'find']);
 
 function pruneOldSnapshots(messages: Message[], snapshotIds: Set<string>) {
   let seenNewest = false;
@@ -541,7 +577,10 @@ function statusFor(tool: string, input: any): string {
     case 'list_actions':
       return 'Looking at the page';
     case 'click':
+    case 'click_at':
       return 'Clicking';
+    case 'find':
+      return 'Finding the right element';
     case 'fill':
       return 'Writing the draft';
     case 'select':
@@ -757,6 +796,55 @@ async function captureTab(tabId: number): Promise<string> {
   return dataUrl.replace(/^data:image\/jpeg;base64,/, '');
 }
 
+// Whether the current act model can read the screenshot itself. When it can't
+// (the GPT-OSS default), the image goes through Groq's vision model instead and
+// the agent gets its answer as text. Set per run in handleAsk.
+let screenshotDirect = false;
+
+// Screenshot pixels per CSS pixel of the last capture, per tab. The vision
+// model reports coordinates in image pixels; CDP clicks want CSS ones.
+const lastShotScale = new Map<number, number>();
+
+/** One trusted-click retry at the spot a fruitless synthetic click hit.
+ * Returns the change report, or null if the retry couldn't run — in which case
+ * the original click's own report stands. */
+async function retryAsTrustedClick(tabId: number, coords: { x: number; y: number }): Promise<string | null> {
+  try {
+    await cdpClick(tabId, coords.x, coords.y);
+    await sleep(700);
+    // The content script still holds the fingerprint from before the synthetic
+    // click, so the report covers what the trusted click actually changed.
+    const after = await sendAction(tabId, { type: 'tidra-action', action: 'describe_change' }, 2);
+    return after?.ok ? String(after.data) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Measure a capture and record its image→CSS scale for later click_at calls. */
+async function measureShot(tabId: number, b64: string): Promise<{ imgW: number; imgH: number }> {
+  let imgW = 0;
+  let imgH = 0;
+  try {
+    const blob = await (await fetch(`data:image/jpeg;base64,${b64}`)).blob();
+    const bmp = await createImageBitmap(blob);
+    imgW = bmp.width;
+    imgH = bmp.height;
+    bmp.close();
+  } catch {
+    /* leave dimensions unknown */
+  }
+  try {
+    const vp = await sendAction(tabId, { type: 'tidra-action', action: 'viewport' }, 2);
+    const cssW = Number(vp?.data?.w) || 0;
+    if (imgW && cssW) lastShotScale.set(tabId, imgW / cssW);
+    else if (vp?.data?.dpr) lastShotScale.set(tabId, Number(vp.data.dpr) || 1);
+  } catch {
+    /* scale stays whatever it was */
+  }
+  return { imgW, imgH };
+}
+
 type ToolContent = string | (TextBlock | ImageBlock)[];
 
 /** Tidra's own working tab, for tasks that didn't start on a page — so the
@@ -964,11 +1052,94 @@ async function execTool(
 
     if (name === 'screenshot') {
       const b64 = await captureTab(tabState.tabId);
-      return {
-        content: [
-          { type: 'text', text: 'Screenshot of the visible part of the page:' },
-          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } },
+      const { imgW, imgH } = await measureShot(tabState.tabId, b64);
+      const dims = imgW ? ` (${imgW}x${imgH} px)` : '';
+      if (screenshotDirect) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Screenshot of the visible part of the page${dims}. click_at takes coordinates in these image pixels.`,
+            },
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } },
+          ],
+          isError: false,
+        };
+      }
+      // The act model can't see images. Groq's vision model becomes its eyes:
+      // it answers the question in text, with image-pixel coordinates so
+      // click_at stays usable. This is what keeps screenshots available on the
+      // cheap text-only tiers instead of being silently dropped from the tools.
+      const setup = await modelSetup();
+      if (!setup) return { content: 'No API key available for the vision model.', isError: true };
+      const question = String(input?.question ?? '').trim() || 'Describe what is on the screen.';
+      const res = await callModel(setup.apiKey, {
+        model: GROQ_MODELS.vision,
+        max_tokens: 900,
+        system:
+          'You are the eyes of a browser agent that cannot see images. Answer its question about the screenshot precisely, based only on what is visible — quote on-screen text exactly. Then list the interactive elements relevant to the question (buttons, fields, controls), each with the center of where to click in image pixels, like: Send button at (x=812, y=1040). Be concrete and brief.',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } },
+              { type: 'text', text: `The screenshot is${dims || ' the visible viewport'}. Question: ${question}` },
+            ],
+          },
         ],
+      });
+      const seen = extractText(res.content as ContentBlock[]).trim();
+      if (!seen) return { content: 'The vision model returned nothing for this screenshot.', isError: true };
+      return {
+        content: `What the screenshot shows${dims}:\n${seen}\n\nTo press something that has no ref in the snapshot, call click_at with those image-pixel coordinates.`,
+        isError: false,
+      };
+    }
+
+    if (name === 'find') {
+      const query = String(input?.query ?? '').trim();
+      if (!query) return { content: 'Pass a query describing the element you need.', isError: true };
+      const setup = await modelSetup();
+      if (!setup) return { content: 'No API key available.', isError: true };
+      const tree = await snapshotAllFrames(tabState.tabId);
+      // A fast model does the matching so the agent never pays for the full
+      // tree in its own context — the same trick Claude-in-Chrome's find uses.
+      const res = await callModel(setup.apiKey, {
+        model: GROQ_MODELS.small,
+        max_tokens: 400,
+        system:
+          'You match elements in a web page\'s accessibility tree. Reply with ONLY the tree lines (verbatim, keeping their [ref_...]) that best match the query — up to 8, best match first, one per line. No commentary. If nothing plausibly matches, reply exactly: NO MATCH',
+        messages: [{ role: 'user', content: `Query: ${query}\n\nTree:\n${tree.slice(0, 40000)}` }],
+      });
+      const hits = extractText(res.content as ContentBlock[]).trim();
+      if (!hits || /^NO MATCH/i.test(hits)) {
+        return {
+          content: `Nothing on the page matches "${query}". Take a snapshot to see what is actually there.`,
+          isError: false,
+        };
+      }
+      return {
+        content: `Elements matching "${query}" — these refs are fresh, refs from earlier snapshots are now stale:\n${hits}`,
+        isError: false,
+      };
+    }
+
+    if (name === 'click_at') {
+      if (!cdpAvailable()) return { content: 'Trusted clicks are not available in this browser.', isError: true };
+      const scale = lastShotScale.get(tabState.tabId) ?? 1;
+      const x = Math.round(Number(input?.x) / scale);
+      const y = Math.round(Number(input?.y) / scale);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        return { content: 'Pass numeric x and y taken from the latest screenshot.', isError: true };
+      }
+      await sendAction(tabState.tabId, { type: 'tidra-action', action: 'mark_before' }, 2).catch(() => {});
+      await cdpClick(tabState.tabId, x, y);
+      await sleep(700);
+      const after = await sendAction(tabState.tabId, { type: 'tidra-action', action: 'describe_change' }, 2).catch(
+        () => null,
+      );
+      return {
+        content: `Clicked at (${input.x}, ${input.y}). ${after?.ok ? after.data : 'Take a snapshot or screenshot to see the result.'}`,
         isError: false,
       };
     }
@@ -991,10 +1162,22 @@ async function execTool(
         10,
         input.ref ? frameId : 0,
       );
+      // Synthetic events are isTrusted:false and some apps ignore them cold.
+      // A click that visibly did nothing gets one retry as a trusted CDP click
+      // at the same spot — indistinguishable from a real mouse. Top frame only:
+      // a sub-frame reports coordinates relative to itself, not the page.
+      if (name === 'click' && res?.ok && res.changed === false && res.coords && frameId === 0 && cdpAvailable()) {
+        const retried = await retryAsTrustedClick(tabState.tabId, res.coords);
+        if (retried) return { content: `${res.data} Retried as a trusted click: ${retried}`, isError: false };
+      }
       return { content: res?.ok ? res.data : res?.error, isError: !res?.ok };
     }
     if (name === 'click_text') {
       const res = await sendAction(tabState.tabId, { type: 'tidra-action', action: 'click_text', text: input.text });
+      if (res?.ok && res.changed === false && res.coords && cdpAvailable()) {
+        const retried = await retryAsTrustedClick(tabState.tabId, res.coords);
+        if (retried) return { content: `${res.data} Retried as a trusted click: ${retried}`, isError: false };
+      }
       return { content: res?.ok ? res.data : res?.error, isError: !res?.ok };
     }
     if (name === 'type_text') {
@@ -1150,14 +1333,17 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   // An attached image forces the vision model — it is the only one that can see
   // it, and it supports tools too, so the agent loop still works.
   const actModel = images.length ? GROQ_MODELS.vision : route === 'act' ? tier.act : tier.chat;
-  // The vision fallback is only offered to models that can actually see.
+  // Screenshots are offered to every act model: one that can see gets the image
+  // itself, the rest get the vision model's text answer (see the screenshot
+  // handler in execTool).
   // create_pdf and create_report survive into the chat route as the tools that
   // need no page: "rewrite this as a memo and give me a report" is a chat
   // request right up until the moment it isn't, and the router should not be
   // able to lose the document.
+  screenshotDirect = supportsVision(actModel);
   const tools: any[] =
     route === 'act'
-      ? TOOLS.filter((t) => t.name !== 'screenshot' || supportsVision(actModel))
+      ? TOOLS
       : TOOLS.filter((t) => t.name === 'create_pdf' || t.name === 'create_report');
 
   const profileText = await profilePreamble();
@@ -1278,6 +1464,7 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
     throw err;
   } finally {
     if (currentAbort === abort) currentAbort = null;
+    await cdpDetachAll(); // drop any debugger attachment (and its info bar)
     await setStatus(null);
   }
 }
@@ -1338,6 +1525,7 @@ async function runSiteAgent(
         'confirm_action',
         'open_url',
         'screenshot',
+        'click_at', // needs a screenshot for coordinates, which a background tab can't take
         'go_back',
         'create_pdf',
         'create_report',
@@ -1457,6 +1645,7 @@ async function runRoutine() {
       await pushChat('✅ Routine finished. Review the drafts in the tabs I opened before sending anything.', 'assistant');
     }
   } finally {
+    await cdpDetachAll();
     routineRunning = false;
   }
 }
@@ -1611,7 +1800,7 @@ async function collectItems(
 ): Promise<{ label: string; key: string; data: Record<string, string> }[]> {
   const tabState: TabState = { tabId };
   const tools = [
-    ...TOOLS.filter((t) => ['snapshot', 'scroll', 'get_page', 'click_text', 'go_back'].includes(t.name)),
+    ...TOOLS.filter((t) => ['snapshot', 'find', 'scroll', 'get_page', 'click_text', 'go_back'].includes(t.name)),
     RECORD_ITEMS,
   ];
   const messages: Message[] = [
@@ -1740,7 +1929,7 @@ async function runJobItem(
   const sampling = job.irreversible && !job.approved;
   const tools = [
     ...TOOLS.filter((t) => {
-      if (t.name === 'screenshot') return false; // a background tab cannot be captured
+      if (t.name === 'screenshot' || t.name === 'click_at') return false; // a background tab cannot be captured
       if (t.name === 'create_report') return false; // 1000 items must not open 1000 tabs
       if (t.name === 'confirm_action') return sampling;
       return true;
@@ -1877,6 +2066,7 @@ async function pumpJob(): Promise<void> {
       if (job.throttleMs) await sleep(job.throttleMs);
     }
   } finally {
+    await cdpDetachAll();
     pumping = false;
   }
 }

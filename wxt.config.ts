@@ -32,6 +32,11 @@ export default defineConfig({
       // DOM, so an <a download> is not available to it — this API is the only
       // way the background can put a file on disk.
       'downloads',
+      // Trusted clicks (lib/cdp.ts): content-script events are isTrusted:false
+      // and some apps ignore them; CDP input is indistinguishable from a real
+      // mouse. Chrome shows a "Tidra started debugging" bar while attached, so
+      // attachment is lazy and dropped when the run ends.
+      'debugger',
     ],
     // <all_urls> is what the content script already matches; it additionally
     // lets the background enumerate frames and capture the tab for the vision

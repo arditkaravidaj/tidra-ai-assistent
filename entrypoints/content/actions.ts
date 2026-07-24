@@ -330,8 +330,10 @@ function describeChange(before: Fingerprint, after: Fingerprint): string {
 /* ── Real input events ────────────────────────────────────────────────────── */
 
 // A single el.click() is one synthetic event; plenty of UIs listen for the whole
-// gesture. Fire the sequence a real mouse produces.
-function realClick(el: HTMLElement) {
+// gesture. Fire the sequence a real mouse produces. Returns where it clicked
+// (CSS viewport coords) so the background can retry the same spot as a trusted
+// CDP click if nothing happened.
+function realClick(el: HTMLElement): { x: number; y: number } {
   el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' as ScrollBehavior });
   const r = el.getBoundingClientRect();
   const clientX = r.left + r.width / 2;
@@ -353,6 +355,7 @@ function realClick(el: HTMLElement) {
   el.dispatchEvent(new PointerEvent('pointerup', ptr));
   el.dispatchEvent(new MouseEvent('mouseup', { ...base, button: 0 }));
   el.dispatchEvent(new MouseEvent('click', { ...base, button: 0, detail: 1 }));
+  return { x: Math.round(clientX), y: Math.round(clientY) };
 }
 
 function setNativeValue(el: HTMLInputElement | HTMLTextAreaElement, value: string) {
@@ -595,9 +598,18 @@ function anchorSave(dataUrl: string, filename: string) {
 
 /* ── Message handling ─────────────────────────────────────────────────────── */
 
-type Reply = { ok: true; data: any } | { ok: false; error: string };
+type Reply =
+  | { ok: true; data: any; coords?: { x: number; y: number }; changed?: boolean }
+  | { ok: false; error: string };
 
 const STALE = (ref: string) => `${ref} is stale or gone — take a new snapshot.`;
+
+const NO_CHANGE = 'no visible change';
+
+// The fingerprint taken just before the last click (or mark_before). Kept here
+// so the background's trusted-click retry can ask "did THAT change anything?"
+// without shuttling the fingerprint through messages.
+let lastBefore: Fingerprint | null = null;
 
 async function handle(msg: any): Promise<Reply> {
   switch (msg.action) {
@@ -622,9 +634,11 @@ async function handle(msg: any): Promise<Reply> {
       if (!el) return { ok: false, error: STALE(msg.ref) };
       const name = accName(el) || el.tagName.toLowerCase();
       const before = fingerprint();
-      realClick(el);
+      lastBefore = before;
+      const coords = realClick(el);
       await settle();
-      return { ok: true, data: `Clicked "${name}". ${describeChange(before, fingerprint())}` };
+      const change = describeChange(before, fingerprint());
+      return { ok: true, data: `Clicked "${name}". ${change}`, coords, changed: !change.startsWith(NO_CHANGE) };
     }
 
     case 'fill': {
@@ -680,9 +694,11 @@ async function handle(msg: any): Promise<Reply> {
       if (!el) return { ok: false, error: `No clickable element matching "${msg.text}"` };
       const name = accName(el);
       const before = fingerprint();
-      realClick(el);
+      lastBefore = before;
+      const coords = realClick(el);
       await settle();
-      return { ok: true, data: `Clicked "${name.slice(0, 60)}". ${describeChange(before, fingerprint())}` };
+      const change = describeChange(before, fingerprint());
+      return { ok: true, data: `Clicked "${name.slice(0, 60)}". ${change}`, coords, changed: !change.startsWith(NO_CHANGE) };
     }
 
     case 'type_text': {
@@ -715,6 +731,23 @@ async function handle(msg: any): Promise<Reply> {
       // Kept for compatibility; snapshot supersedes it.
       return { ok: true, data: { tree: snapshot().tree } };
     }
+
+    // Support for the background's trusted (CDP) clicks, which happen outside
+    // this script: mark_before snapshots "what the screen was", describe_change
+    // settles and reports what the click did against that mark.
+    case 'mark_before': {
+      lastBefore = fingerprint();
+      return { ok: true, data: 'ok' };
+    }
+
+    case 'describe_change': {
+      await settle();
+      const change = lastBefore ? describeChange(lastBefore, fingerprint()) : 'done';
+      return { ok: true, data: change, changed: !change.startsWith(NO_CHANGE) };
+    }
+
+    case 'viewport':
+      return { ok: true, data: { w: innerWidth, h: innerHeight, dpr: devicePixelRatio } };
 
     default:
       return { ok: false, error: `Unknown action: ${msg.action}` };
