@@ -1,7 +1,21 @@
 # Tidra Website
 
-The marketing/landing site for Tidra. Not built yet — this folder is the home for it.
+The Tidra landing page — static HTML/CSS/JS, no build step.
 
-Current contents:
+Black canvas, big white type (Instrument Serif + Inter), and a floating white
+nav island. Brand assets and promo videos live in `assets/`.
 
-- `tidra-intro.mp4`, `tidra-promo.mp4`, `tidra-teaser.mp4` — promo videos to use on the site.
+## Run locally
+
+```bash
+python3 -m http.server 4173 --directory website
+```
+
+Then open http://localhost:4173.
+
+## Files
+
+- `index.html` — the page
+- `style.css` — all styling
+- `main.js` — nav hide-on-scroll + section reveal
+- `assets/` — icon + `tidra-intro.mp4`, `tidra-promo.mp4`, `tidra-teaser.mp4`
