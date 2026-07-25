@@ -431,6 +431,9 @@
 .tidra-messages {
   flex: 1;
   overflow-y: auto;
+  /* Hitting the top or bottom of the thread must not hand the rest of the
+     scroll to the page underneath. */
+  overscroll-behavior: contain;
   padding: 18px 18px 8px;
   display: flex;
   flex-direction: column;
@@ -1257,6 +1260,7 @@
   padding: 6px;
   max-height: 264px;
   overflow-y: auto;
+  overscroll-behavior: contain;
   border-radius: 18px;
   border: 0.5px solid rgba(0, 0, 0, 0.08);
   background: #ffffff;
@@ -1360,6 +1364,43 @@
 }
 
 /* ── Step trail — "watch Tidra work", expandable under the typing dots ──── */
+/* Markdown tables in chat answers, rendered as real tables. The bubble is
+   pre-wrap; cells wrap normally, and a wide table scrolls inside its frame. */
+.tidra-table-wrap {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  margin: 8px 0;
+  border: 1px solid rgba(120, 120, 128, 0.18);
+  border-radius: 10px;
+}
+.tidra-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12.5px;
+  line-height: 1.45;
+  white-space: normal;
+}
+.tidra-table th,
+.tidra-table td {
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid rgba(120, 120, 128, 0.14);
+}
+.tidra-table thead th {
+  background: rgba(120, 120, 128, 0.08);
+  font-weight: 600;
+}
+.tidra-table tbody tr:last-child td {
+  border-bottom: none;
+}
+@media (prefers-color-scheme: dark) {
+  .tidra-table-wrap { border-color: rgba(255, 255, 255, 0.14); }
+  .tidra-table th,
+  .tidra-table td { border-bottom-color: rgba(255, 255, 255, 0.1); }
+  .tidra-table thead th { background: rgba(255, 255, 255, 0.07); }
+}
+
 .tidra-steps {
   margin: 2px 0 4px;
   font-size: 12px;
@@ -1385,20 +1426,68 @@
   font-size: 10px;
   transition: transform 0.15s ease;
 }
+/* Inside the pill the icon rides bare — no tile, just the glyph. */
+.tidra-steps summary .tidra-step-ic {
+  width: 15px;
+  height: 15px;
+  background: none;
+  color: inherit;
+}
 .tidra-steps[open] summary::before {
   transform: rotate(90deg);
 }
-.tidra-steps ol {
-  margin: 6px 0 0;
-  padding-left: 22px;
+.tidra-steps ul {
+  margin: 8px 0 0;
+  padding: 0 0 0 4px;
+  list-style: none;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 6px;
 }
 .tidra-steps li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   line-height: 1.4;
+  min-width: 0;
+}
+.tidra-steps li span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The little rounded tile each step icon sits in. */
+.tidra-step-ic {
+  flex: none;
+  width: 21px;
+  height: 21px;
+  border-radius: 6px;
+  background: rgba(120, 120, 128, 0.12);
+  color: rgba(60, 60, 67, 0.65);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+/* The step in flight reads slightly stronger than the finished ones. */
+.tidra-step-now {
+  color: rgba(60, 60, 67, 0.92);
+}
+.tidra-step-now .tidra-step-ic {
+  background: rgba(0, 0, 0, 0.08);
+  color: rgba(0, 0, 0, 0.88);
 }
 @media (prefers-color-scheme: dark) {
   .tidra-steps { color: rgba(235, 235, 245, 0.55); }
   .tidra-steps summary { background: rgba(255, 255, 255, 0.1); }
+  .tidra-step-ic {
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(235, 235, 245, 0.6);
+  }
+  .tidra-step-now { color: rgba(235, 235, 245, 0.92); }
+  /* On dark, "black" reads as its opposite — the current step still has to be
+     the one that stands out. */
+  .tidra-step-now .tidra-step-ic {
+    background: rgba(255, 255, 255, 0.18);
+    color: rgba(255, 255, 255, 0.95);
+  }
 }

@@ -482,6 +482,73 @@ function findInput(hint?: string): HTMLElement | null {
   })[0];
 }
 
+/* ── File uploads ─────────────────────────────────────────────────────────── */
+
+// Attaching a file is the one action that can't be done by clicking: the click
+// opens the OS file dialog, which lives outside the page and outside anything an
+// extension can reach. So the dialog is never opened — the bytes are written
+// straight into the <input type="file"> instead, and the page is told the same
+// story it would have been told by a real pick.
+//
+// The catch is that on a modern site that input is almost never visible: it sits
+// at zero size behind a styled "Add media" button. So it can't be found the way
+// every other element here is found (by what the user can see) — it's collected
+// blind, everywhere, including the places `renderable` would reject.
+
+function fileInputs(root: Document | ShadowRoot | Element = document): HTMLInputElement[] {
+  const out: HTMLInputElement[] = [];
+  for (const el of Array.from(root.querySelectorAll<HTMLElement>('*'))) {
+    if (el.tagName === 'INPUT' && (el as HTMLInputElement).type === 'file') {
+      out.push(el as HTMLInputElement);
+    }
+    if (el.shadowRoot) out.push(...fileInputs(el.shadowRoot));
+    if (el.tagName === 'IFRAME') {
+      try {
+        const doc = (el as HTMLIFrameElement).contentDocument;
+        if (doc) out.push(...fileInputs(doc));
+      } catch {
+        // Cross-origin frame — its own content-script instance handles it.
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * The input this file belongs in. A page can have several (avatar, banner,
+ * post attachment), so an `accept` that actually matches the file wins over one
+ * that takes anything, and a disconnected leftover never wins at all.
+ */
+function pickFileInput(mime: string, ref?: string): HTMLInputElement | null {
+  if (ref) {
+    const el = get(ref);
+    if (el?.tagName === 'INPUT' && (el as HTMLInputElement).type === 'file') return el as HTMLInputElement;
+    // A ref pointing at the *button* is the common case — the real input is
+    // usually its sibling or a descendant of the same container.
+    const near = el?.closest('form, [role="dialog"], div');
+    if (near) {
+      const found = fileInputs(near)[0];
+      if (found) return found;
+    }
+  }
+  const all = fileInputs().filter((el) => el.isConnected && !el.disabled);
+  if (!all.length) return null;
+  const kind = mime.split('/')[0];
+  return (
+    all.find((el) => el.accept && el.accept.includes(mime)) ??
+    all.find((el) => el.accept && el.accept.includes(`${kind}/*`)) ??
+    all.find((el) => !el.accept) ??
+    all[0]
+  );
+}
+
+function base64ToBytes(b64: string) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
 /* ── Media ────────────────────────────────────────────────────────────────── */
 
 // "Download this image" has to resolve to ONE image, and the snapshot tree only
@@ -711,6 +778,38 @@ async function handle(msg: any): Promise<Reply> {
       const where = accName(el) || el.tagName.toLowerCase();
       const change = msg.submit ? ` ${describeChange(before, fingerprint())}` : '';
       return { ok: true, data: `Typed into "${where.slice(0, 40)}"${msg.submit ? ' and submitted.' : '.'}${change}` };
+    }
+
+    case 'attach_file': {
+      const name = String(msg.name ?? 'file');
+      const mime = String(msg.mime ?? 'application/octet-stream');
+      if (!msg.base64) return { ok: false, error: 'No file contents were passed.' };
+      const input = pickFileInput(mime, msg.ref);
+      if (!input) {
+        return {
+          ok: false,
+          error:
+            'No file input on this page. Click the page\'s "Add photo"/attach button first — the input usually only exists once the composer is open — then try again.',
+        };
+      }
+      const before = fingerprint();
+      const file = new File([base64ToBytes(String(msg.base64))], name, { type: mime });
+      // The page is watching for a user pick, and a user pick sets .files and
+      // fires input+change. DataTransfer is the only way to build a FileList.
+      const dt = new DataTransfer();
+      if (msg.append) for (const f of Array.from(input.files ?? [])) dt.items.add(f);
+      dt.items.add(file);
+      input.files = dt.files;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      // Uploads render a preview, which takes longer than a click does.
+      await settle(6000);
+      const change = describeChange(before, fingerprint());
+      return {
+        ok: true,
+        data: `Attached "${name}". ${change}`,
+        changed: !change.startsWith(NO_CHANGE),
+      };
     }
 
     case 'list_images':

@@ -1,27 +1,9 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Wordmark } from '../../components/Wordmark';
+import { renderBlocks, renderRich } from '../../components/richtext';
 import { blobToBase64, record, type Recorder } from '../../lib/voice';
 import { filterSkills, loadSkills, type Skill } from '../../lib/skills';
 import { archiveChat } from '../../lib/library';
-
-// Minimal inline markdown → JSX: **bold**, *italic*/_italic_, `code`.
-// Newlines are preserved by CSS (white-space: pre-wrap); emoji pass through.
-function renderRich(text: string): ReactNode {
-  const re = /(\*\*([^*]+?)\*\*|__([^_]+?)__|\*([^*\n]+?)\*|_([^_\n]+?)_|`([^`]+?)`)/g;
-  const out: ReactNode[] = [];
-  let last = 0;
-  let m: RegExpExecArray | null;
-  let k = 0;
-  while ((m = re.exec(text))) {
-    if (m.index > last) out.push(text.slice(last, m.index));
-    if (m[2] != null || m[3] != null) out.push(<strong key={k++}>{m[2] ?? m[3]}</strong>);
-    else if (m[4] != null || m[5] != null) out.push(<em key={k++}>{m[4] ?? m[5]}</em>);
-    else if (m[6] != null) out.push(<code key={k++}>{m[6]}</code>);
-    last = m.index + m[0].length;
-  }
-  if (last < text.length) out.push(text.slice(last));
-  return out;
-}
 
 interface Attachment {
   kind: 'image' | 'text';
@@ -199,6 +181,92 @@ const IconClose = () => (
   </svg>
 );
 
+// One icon per agent step, matched on the status text the background writes
+// (see statusFor there). Same stroke weight and tone as the other icons.
+function StepIcon({ step }: { step: string }) {
+  const s = step.toLowerCase();
+  const svg = (children: React.ReactNode) => (
+    <span className="tidra-step-ic">
+      <svg
+        width="13"
+        height="13"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        {children}
+      </svg>
+    </span>
+  );
+
+  // Opening a site — globe
+  if (s.startsWith('opening')) {
+    return svg(
+      <>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M3 12h18M12 3c2.5 2.5 3.8 5.7 3.8 9s-1.3 6.5-3.8 9c-2.5-2.5-3.8-5.7-3.8-9S9.5 5.5 12 3Z" />
+      </>,
+    );
+  }
+  // Clicking — pointer
+  if (s.includes('clicking')) {
+    return svg(<path d="M5.5 3.5 19 10.8l-6 1.7-3.5 5.3-4-14.3Z" />);
+  }
+  // Report / PDF / downloading — arrow into tray. Checked before "writing"
+  // so "Writing the report" lands here, not on the pencil.
+  if (s.includes('report') || s.includes('pdf') || s.includes('downloading')) {
+    return svg(<path d="M12 4v10M8 10.5l4 4 4-4M5 19.5h14" />);
+  }
+  // Writing / filling a field — pencil
+  if (s.includes('writing') || s.includes('filling') || s.includes('draft')) {
+    return svg(<path d="M4.5 19.5l.9-3.6L16.8 4.5a2 2 0 0 1 2.8 2.8L8.1 18.6l-3.6.9Z" />);
+  }
+  // Choosing an option — checkmark
+  if (s.includes('choosing')) {
+    return svg(<path d="M4.5 12.5l5 5L19.5 7" />);
+  }
+  // Looking at the page / screenshot — eye
+  if (s.includes('looking') || s.includes('taking a look')) {
+    return svg(
+      <>
+        <path d="M2.5 12S6 6.4 12 6.4 21.5 12 21.5 12 18 17.6 12 17.6 2.5 12 2.5 12Z" />
+        <circle cx="12" cy="12" r="2.6" />
+      </>,
+    );
+  }
+  // Reading content — document with lines
+  if (s.includes('reading')) {
+    return svg(
+      <>
+        <path d="M6.5 3h8l4 4v14h-12V3Z" />
+        <path d="M9.5 12h5M9.5 15.5h5" />
+      </>,
+    );
+  }
+  // Finding an element / building the work list — magnifier
+  if (s.includes('finding') || s.includes('building')) {
+    return svg(
+      <>
+        <circle cx="11" cy="11" r="6.2" />
+        <path d="M20 20l-4.4-4.4" />
+      </>,
+    );
+  }
+  // Scrolling — vertical arrows
+  if (s.includes('scrolling')) {
+    return svg(<path d="M12 4v16M8.5 7.5 12 4l3.5 3.5M8.5 16.5 12 20l3.5-3.5" />);
+  }
+  // Batch progress ("3 of 10 · …") — loop
+  if (/\d+\s*\/\s*\d+/.test(s)) {
+    return svg(<path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1M20.5 4.2v4.3h-4.3" />);
+  }
+  // Thinking / getting started / anything else — sparkle
+  return svg(<path d="M12 3.5 13.9 10l6.6 2-6.6 2L12 20.5 10.1 14l-6.6-2 6.6-2L12 3.5Z" />);
+}
+
 // Tidra brand mark — the caret logo. Bobs gently while thinking.
 function Orb({
   sm,
@@ -314,6 +382,64 @@ export function Island() {
     return () => document.removeEventListener('pointerdown', onDown, true);
   }, [open]);
 
+  // Keep the wheel inside the panel.
+  //
+  // Two separate things send a scroll to the page instead of the chat:
+  //  1. Nothing under the pointer can scroll (the header, the empty thread), so
+  //     the browser walks up and scrolls the page — our shadow root is no
+  //     barrier to that.
+  //  2. The site runs a smooth-scroll library (Lenis, Locomotive, ScrollSmoother
+  //     and friends). Those listen for `wheel` on window and scroll the page
+  //     themselves, without ever looking at where the pointer is — so the page
+  //     moves even when the chat scrolls correctly.
+  //
+  // stopPropagation answers (2): the event never reaches window, so the library
+  // never runs. preventDefault answers (1), but only when nothing inside the
+  // panel could have used the scroll — otherwise it would block our own lists.
+  useEffect(() => {
+    if (!open) return;
+    const el = panelRef.current;
+    if (!el) return;
+
+    const canScroll = (path: EventTarget[], dx: number, dy: number) => {
+      // A trackpad sends both axes at once; the bigger one is the gesture. This
+      // matters for the wide tables in answers, which scroll sideways.
+      const horizontal = Math.abs(dx) > Math.abs(dy);
+      const delta = horizontal ? dx : dy;
+      if (!delta) return true; // no movement to absorb — nothing to block
+      for (const node of path) {
+        if (node === el) break;
+        if (!(node instanceof HTMLElement)) continue;
+        const style = getComputedStyle(node);
+        const overflow = horizontal ? style.overflowX : style.overflowY;
+        if (!/(auto|scroll)/.test(overflow)) continue;
+        const room = horizontal
+          ? node.scrollWidth - node.clientWidth
+          : node.scrollHeight - node.clientHeight;
+        if (room <= 1) continue;
+        const at = horizontal ? node.scrollLeft : node.scrollTop;
+        // Already hard against that end — it cannot absorb any more this way.
+        if (delta < 0 && at <= 0) continue;
+        if (delta > 0 && at >= room - 1) continue;
+        return true;
+      }
+      return false;
+    };
+
+    const onWheel = (e: WheelEvent) => {
+      e.stopPropagation();
+      if (!canScroll(e.composedPath(), e.deltaX, e.deltaY)) e.preventDefault();
+    };
+    const onTouchMove = (e: TouchEvent) => e.stopPropagation();
+
+    el.addEventListener('wheel', onWheel, { passive: false });
+    el.addEventListener('touchmove', onTouchMove, { passive: true });
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+      el.removeEventListener('touchmove', onTouchMove);
+    };
+  }, [open]);
+
   // Drag the open panel by its header to reposition it anywhere on screen.
   function onPanelDragStart(e: React.PointerEvent) {
     if ((e.target as HTMLElement).closest('button')) return; // let header buttons work
@@ -388,28 +514,6 @@ export function Island() {
       browser.storage.local.set({ tidraChat: { ...chat, loading: false }, tidraPending: null });
     });
   }
-
-  // While collapsed: the island tilts in 3D toward the cursor (and drifts a
-  // few px toward it), and the orb's pupil follows the mouse.
-  useEffect(() => {
-    if (open) return;
-    const onMove = (e: MouseEvent) => {
-      const isl = islandRef.current;
-      if (isl && !isl.classList.contains('tidra-dragging') && !isl.classList.contains('tidra-island-actions')) {
-        const ir = isl.getBoundingClientRect();
-        const icx = ir.left + ir.width / 2;
-        const icy = ir.top + ir.height / 2;
-        const nx = Math.max(-1, Math.min(1, (e.clientX - icx) / 400));
-        const ny = Math.max(-1, Math.min(1, (e.clientY - icy) / 400));
-        const ry = nx * 12; // turn left/right toward cursor
-        const rx = -ny * 9; // tip up/down toward cursor
-        const base = posRef.current ? '' : 'translateX(-50%) ';
-        isl.style.transform = `${base}translate(${nx * 4}px, ${ny * 4}px) perspective(520px) rotateX(${rx}deg) rotateY(${ry}deg)`;
-      }
-    };
-    window.addEventListener('mousemove', onMove);
-    return () => window.removeEventListener('mousemove', onMove);
-  }, [open]);
 
   // Drag to reposition; a click (no drag) opens the panel.
   function onPointerDown(e: React.PointerEvent) {
@@ -1263,7 +1367,7 @@ export function Island() {
           }
           return (
             <div key={i} className="tidra-answer">
-              <div className="tidra-answer-text">{renderRich(m.text)}</div>
+              <div className="tidra-answer-text">{renderBlocks(m.text)}</div>
               <div className="tidra-actions">
                 <button
                   className={'tidra-act' + (reactions[i] === 'up' ? ' tidra-act-on' : '')}
@@ -1296,13 +1400,17 @@ export function Island() {
         {chat.loading && steps.length > 0 && (
           <details className="tidra-steps">
             <summary>
+              <StepIcon step={status || 'Working'} />
               {status || 'Working'} · {steps.length} step{steps.length === 1 ? '' : 's'}
             </summary>
-            <ol>
+            <ul>
               {steps.map((s, i) => (
-                <li key={i}>{s}</li>
+                <li key={i} className={i === steps.length - 1 ? 'tidra-step-now' : ''}>
+                  <StepIcon step={s} />
+                  <span>{s}</span>
+                </li>
               ))}
-            </ol>
+            </ul>
           </details>
         )}
         {showSettingsLink && (

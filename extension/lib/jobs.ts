@@ -44,12 +44,21 @@ export type JobState =
   | 'done'
   | 'cancelled';
 
+/**
+ * `act` repeats an action over many targets and reports what landed.
+ * `research` visits many targets to FIND something, and its real output is the
+ * answer synthesised from every item's finding — the counts are just progress.
+ */
+export type JobMode = 'act' | 'research';
+
 export interface Job {
   id: string;
   /** The user's original request, verbatim. */
   goal: string;
   /** What to do for ONE item — the per-item instruction. */
   task: string;
+  /** Repeat an action, or gather findings and answer at the end. */
+  mode: JobMode;
   /** Where each item starts, if the work happens on a site. */
   site?: string;
   /** Tab the job works in, so items don't fight over the user's current page. */
@@ -145,6 +154,7 @@ export async function allItems(job: Job): Promise<JobItem[]> {
 export interface NewJob {
   goal: string;
   task: string;
+  mode?: JobMode;
   site?: string;
   irreversible: boolean;
   stepsPerItem?: number;
@@ -152,10 +162,12 @@ export interface NewJob {
 }
 
 export function newJob(spec: NewJob): Job {
+  const mode = spec.mode ?? 'act';
   return {
     id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
     goal: spec.goal,
     task: spec.task,
+    mode,
     site: spec.site,
     total: 0,
     cursor: 0,
@@ -246,7 +258,9 @@ export async function settle(
   const at = item.i % CHUNK;
   if (chunk[at]) {
     chunk[at].state = state;
-    chunk[at].result = result.slice(0, 300);
+    // An act's result is a receipt — one line is plenty. A research finding IS
+    // the deliverable, and gets read back at the end, so it keeps more room.
+    chunk[at].result = result.slice(0, job.mode === 'research' ? 700 : 300);
     await saveChunk(job.id, n, chunk);
   }
   if (state === 'done') job.done++;

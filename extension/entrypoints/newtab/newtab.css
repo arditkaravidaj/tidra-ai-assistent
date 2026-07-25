@@ -921,6 +921,37 @@ body {
   background: rgba(0, 0, 0, 0.04);
 }
 
+/* Connected folders — same card as a site chip, with a folder glyph instead of
+   a favicon, and a state a site chip can't have: access that needs re-granting. */
+.nt-folder-list {
+  margin-top: 9px;
+}
+.nt-fchip-ico {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #ececef;
+  color: #55585e;
+}
+.nt-fchip-stale {
+  /* Amber, not red: nothing is broken, it just needs a click. */
+  border-color: rgba(180, 120, 0, 0.35);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.14), 0 0 0 1px rgba(180, 120, 0, 0.18);
+}
+.nt-fchip-stale .nt-rchip-open {
+  cursor: pointer;
+}
+.nt-fchip-fix {
+  margin-left: 2px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(180, 120, 0, 0.13);
+  color: #8a5b00;
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
 /* Empty state before a routine has been learned */
 .nt-routine-empty {
   margin: 2px auto;
@@ -1128,6 +1159,16 @@ body {
   transition: border-color 0.15s ease;
 }
 .nt-modal-input:focus { border-color: rgba(0, 0, 0, 0.42); }
+/* A <select> needs the native chrome suppressed to match the text inputs, and
+   its own caret drawn back in. */
+.nt-modal-select {
+  appearance: none;
+  background: #fff
+    url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none'%3E%3Cpath d='m6 9 6 6 6-6' stroke='%230f1114' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    no-repeat right 13px center;
+  padding-right: 38px;
+  cursor: pointer;
+}
 .nt-modal-ico-add {
   display: inline-flex;
   align-items: center;
@@ -1423,4 +1464,33 @@ body {
 }
 .nt-gear:active {
   transform: translateY(0) scale(0.97);
+}
+
+/* Markdown tables in chat answers — same treatment as the island's. */
+.tidra-table-wrap {
+  overflow-x: auto;
+  margin: 8px 0;
+  border: 1px solid rgba(120, 120, 128, 0.22);
+  border-radius: 10px;
+}
+.tidra-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: normal;
+}
+.tidra-table th,
+.tidra-table td {
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid rgba(120, 120, 128, 0.16);
+}
+.tidra-table thead th {
+  background: rgba(120, 120, 128, 0.1);
+  font-weight: 600;
+}
+.tidra-table tbody tr:last-child td {
+  border-bottom: none;
 }

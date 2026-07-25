@@ -1,29 +1,21 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import ReactDOM from 'react-dom/client';
 import { streamText, tierFor } from '../../lib/llm';
 import { record, transcribe, type Recorder } from '../../lib/voice';
 import { expandSkill, filterSkills, loadSkills, matchSkill, type Skill } from '../../lib/skills';
 import { defaultTaskFor, faviconUrl, prettyDomain } from '../../lib/routine';
 import { archiveChat, reportUrl } from '../../lib/library';
+import {
+  connectFolder,
+  folderAccess,
+  listFolders,
+  removeFolder,
+  requestFolderAccess,
+  type FolderAccess,
+  type FolderRecord,
+} from '../../lib/folders';
 import { Wordmark } from '../../components/Wordmark';
-
-// Minimal inline markdown → JSX: **bold**, *italic*/_italic_, `code`.
-function renderRich(text: string): ReactNode {
-  const re = /(\*\*([^*]+?)\*\*|__([^_]+?)__|\*([^*\n]+?)\*|_([^_\n]+?)_|`([^`]+?)`)/g;
-  const out: ReactNode[] = [];
-  let last = 0;
-  let m: RegExpExecArray | null;
-  let k = 0;
-  while ((m = re.exec(text))) {
-    if (m.index > last) out.push(text.slice(last, m.index));
-    if (m[2] != null || m[3] != null) out.push(<strong key={k++}>{m[2] ?? m[3]}</strong>);
-    else if (m[4] != null || m[5] != null) out.push(<em key={k++}>{m[4] ?? m[5]}</em>);
-    else if (m[6] != null) out.push(<code key={k++}>{m[6]}</code>);
-    last = m.index + m[0].length;
-  }
-  if (last < text.length) out.push(text.slice(last));
-  return out;
-}
+import { renderBlocks } from '../../components/richtext';
 import '../content/font.css';
 import './newtab.css';
 
@@ -34,7 +26,9 @@ const SYSTEM = `You are Tidra, a warm, sharp assistant living in the user's brow
 Answer questions directly and concisely — a few tight sentences or short bullets, no filler preamble.
 Answer from what you know.
 If answering would need the browser — opening a website, or looking at the user's own account (their inbox, messages, notifications, feed, orders, calendar) — do NOT say you can't access it. Reply with exactly NEEDS_BROWSER and nothing else, and it will be handed to the part of Tidra that can.
+The same goes for the user's own files: any request that names a folder of theirs, or their files, documents, PDFs, photos or downloads, is NEEDS_BROWSER. Tidra can read folders the user connected — you just can't do it from here.
 If the request hangs on something only the user knows — audience, tone, goal, scope — ask ONE short clarifying question instead of guessing; never more than one.
+Never ask the user for something Tidra could look up itself. "What files are in that folder?" or "what does the page say?" are not clarifying questions — they are the job. Reply NEEDS_BROWSER instead.
 Reply in the language the user writes in.`;
 
 // The local chat model emits this alone when a request turns out to need the
@@ -96,6 +90,8 @@ function asUrl(raw: string): string | null {
 }
 
 // A query that reads like a question / request defaults to Chat; otherwise Google.
+// Only ever asked about the first thing typed — see `chatMode`. A reply in an
+// open conversation is a reply whatever it looks like.
 const QUESTION_RE =
   /^(who|what|when|where|why|how|which|whose|whom|is|are|was|were|do|does|did|can|could|should|would|will|explain|summar|write|draft|help|tell|give|make|translate|fix|generate|compare|define)\b/i;
 function looksLikeChat(q: string): boolean {
@@ -319,6 +315,54 @@ function RoutineChip({
   );
 }
 
+// A connected folder, plus whether it can be read right now. The two are stored
+// apart because only the handle is durable — the permission has to be re-checked
+// every time this page loads.
+type FolderRow = { rec: FolderRecord; access: FolderAccess };
+
+// One connected folder. Unlike a site chip, this one can be in a state the user
+// has to fix: Chrome hands back the handle after a restart but not the
+// permission, so the chip becomes a one-click "Reconnect" rather than quietly
+// failing the next time a routine runs.
+function FolderChip({
+  row,
+  onFix,
+  onRemove,
+}: {
+  row: FolderRow;
+  onFix: (row: FolderRow) => void;
+  onRemove: (row: FolderRow) => void;
+}) {
+  const ok = row.access === 'granted';
+  return (
+    <span className={'nt-rchip nt-fchip' + (ok ? '' : ' nt-fchip-stale')}>
+      <button
+        className="nt-rchip-open"
+        onClick={() => !ok && onFix(row)}
+        title={ok ? `${row.rec.name} — Tidra can read this folder` : 'Give Tidra access to this folder again'}
+      >
+        <span className="nt-rchip-ico nt-fchip-ico">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+            <path
+              d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </span>
+        <span className="nt-rchip-name">{row.rec.label}</span>
+        {!ok && <span className="nt-fchip-fix">{row.access === 'missing' ? 'Missing' : 'Reconnect'}</span>}
+      </button>
+      <button className="nt-rchip-x" onClick={() => onRemove(row)} title="Disconnect this folder" aria-label="Disconnect">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+          <path d="M18 6 6 18M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+        </svg>
+      </button>
+    </span>
+  );
+}
+
 type Turn = { role: 'user' | 'assistant'; text: string };
 
 function NewTab() {
@@ -340,9 +384,13 @@ function NewTab() {
   const [tasks, setTasks] = useState<Record<string, string>>({});
   const [taskDomain, setTaskDomain] = useState<string | null>(null);
   const [taskDraft, setTaskDraft] = useState('');
+  const [routineFolders, setRoutineFolders] = useState<Record<string, string>>({});
+  const [folderDraft, setFolderDraft] = useState('');
   const [addMode, setAddMode] = useState(false);
   const [addUrl, setAddUrl] = useState('');
   const [routineStarted, setRoutineStarted] = useState(false);
+  const [folders, setFolders] = useState<FolderRow[]>([]);
+  const [folderNote, setFolderNote] = useState<string | null>(null);
   const [profile, setProfile] = useState<NtProfile>({});
   const [profileOpen, setProfileOpen] = useState(false);
   const [skills, setSkills] = useState<Skill[]>([]);
@@ -392,11 +440,76 @@ function NewTab() {
     browser.storage.local.get('tidraRoutineManual').then(({ tidraRoutineManual }) => {
       if (Array.isArray(tidraRoutineManual)) setManual(tidraRoutineManual as TileData[]);
     });
+    browser.storage.local.get('tidraRoutineFolders').then(({ tidraRoutineFolders }) => {
+      if (tidraRoutineFolders && typeof tidraRoutineFolders === 'object')
+        setRoutineFolders(tidraRoutineFolders as Record<string, string>);
+    });
     browser.storage.local.get('tidraProfile').then(({ tidraProfile }) => {
       if (tidraProfile && typeof tidraProfile === 'object') setProfile(tidraProfile as NtProfile);
     });
     loadSkills().then(setSkills).catch(() => {});
   }, []);
+
+  // Connected folders. Re-checked whenever this page comes back into view: the
+  // permission can lapse between two looks at the new tab (a browser restart is
+  // all it takes), and a chip claiming "connected" when it isn't would send the
+  // user's daily routine off to fail out of sight.
+  const refreshFolders = useCallback(async () => {
+    const recs = await listFolders();
+    const rows = await Promise.all(recs.map(async (rec) => ({ rec, access: await folderAccess(rec) })));
+    setFolders(rows);
+  }, []);
+
+  useEffect(() => {
+    void refreshFolders();
+    const onShow = () => {
+      if (document.visibilityState === 'visible') void refreshFolders();
+    };
+    document.addEventListener('visibilitychange', onShow);
+    return () => document.removeEventListener('visibilitychange', onShow);
+  }, [refreshFolders]);
+
+  // Pick a folder. Only a real click can do this — there is no way to open the
+  // picker from the background, which is why this button exists at all.
+  async function addFolder() {
+    setFolderNote(null);
+    try {
+      const rec = await connectFolder();
+      if (!rec) return; // cancelled — not an error
+      await refreshFolders();
+      setFolderNote(
+        `Tidra can now read “${rec.label}”. Say what to do with it — e.g. “every day, post the next picture from ${rec.label} to LinkedIn”.`,
+      );
+    } catch (err) {
+      setFolderNote(err instanceof Error ? err.message : 'That folder could not be opened.');
+    }
+  }
+
+  // Win the access back. A lapsed permission takes one click; a folder that has
+  // actually moved or been deleted needs picking again, and the dead row goes.
+  async function fixFolder(row: FolderRow) {
+    setFolderNote(null);
+    if ((await requestFolderAccess(row.rec)) === 'granted') {
+      await refreshFolders();
+      return;
+    }
+    const rec = await connectFolder(row.rec.label).catch(() => null);
+    if (rec && rec.id !== row.rec.id) await removeFolder(row.rec.id);
+    await refreshFolders();
+  }
+
+  async function disconnectFolder(row: FolderRow) {
+    await removeFolder(row.rec.id);
+    // Routines pointing at it go with it — a binding to a folder that no longer
+    // exists would fail at 8am with nothing on screen to explain why.
+    setRoutineFolders((prev) => {
+      const next = Object.fromEntries(Object.entries(prev).filter(([, id]) => id !== row.rec.id));
+      browser.storage.local.set({ tidraRoutineFolders: next });
+      return next;
+    });
+    setFolderNote(null);
+    await refreshFolders();
+  }
 
   // The routine shown = learned sites + ones you added manually, de-duplicated.
   const routineSites: TileData[] = (() => {
@@ -410,18 +523,32 @@ function NewTab() {
     return out;
   })();
 
+  // Which folder each site's routine may use, by folder id — an id rather than a
+  // label so renaming a folder doesn't silently unbind the routine.
+  function bindFolder(domain: string, folderId: string) {
+    setRoutineFolders((prev) => {
+      const next = { ...prev };
+      if (folderId) next[domain] = folderId;
+      else delete next[domain];
+      browser.storage.local.set({ tidraRoutineFolders: next });
+      return next;
+    });
+  }
+
   // Open the per-site routine editor (falls back to a suggested description).
   function openTask(domain: string) {
     const site = routineSites.find((s) => s.domain === domain);
     setAddMode(false);
     setTaskDomain(domain);
     setTaskDraft(tasks[domain] ?? defaultTaskFor(domain, site?.label ?? domain));
+    setFolderDraft(routineFolders[domain] ?? '');
   }
   function saveTask() {
     if (!taskDomain) return;
     const next = { ...tasks, [taskDomain]: taskDraft.trim() };
     setTasks(next);
     browser.storage.local.set({ tidraRoutineTasks: next });
+    bindFolder(taskDomain, folderDraft);
     setTaskDomain(null);
   }
   const taskSite = taskDomain ? routineSites.find((s) => s.domain === taskDomain) : null;
@@ -432,6 +559,7 @@ function NewTab() {
     setAddMode(true);
     setAddUrl('');
     setTaskDraft('');
+    setFolderDraft('');
   }
   function saveAdd() {
     const raw = addUrl.trim();
@@ -452,6 +580,7 @@ function NewTab() {
       setTasks(nextTasks);
       browser.storage.local.set({ tidraRoutineTasks: nextTasks });
     }
+    bindFolder(domain, folderDraft);
     // un-hide it if it had been removed before
     browser.storage.local.get('tidraRoutineHidden').then(({ tidraRoutineHidden }) => {
       const hidden = new Set((tidraRoutineHidden as string[]) || []);
@@ -576,11 +705,17 @@ function NewTab() {
         sk?.skill.mode === 'chat'
           ? null // the skill said chat — no need to ask the router
           : ((await browser.runtime
-              .sendMessage({ type: 'tidra-route', prompt: payload })
+              .sendMessage({
+                type: 'tidra-route',
+                prompt: payload,
+                // The router needs the thread too — a follow-up like "what are
+                // these?" carries none of its own meaning.
+                history: turns.filter((t) => t.text.trim()).map((t) => ({ role: t.role, text: t.text })),
+              })
               .catch(() => null)) as { route?: string } | null);
 
-      if (routed?.route === 'act') {
-        await handOff(text);
+      if (routed?.route === 'act' || routed?.route === 'look') {
+        await handOff(text, routed.route);
         return;
       }
 
@@ -636,15 +771,26 @@ function NewTab() {
   }
 
   // Give the request to the background agent, which drives THIS tab — so the
-  // island picks the conversation up on whatever site it opens.
-  async function handOff(text: string) {
+  // island picks the conversation up on whatever site it opens. `intent` passes
+  // the router's verdict through, so a pure lookup keeps its read-only,
+  // out-of-sight treatment instead of being forced down the act path.
+  async function handOff(text: string, intent: 'look' | 'act' = 'act') {
     setTurns((prev) => {
       const next = [...prev];
       next[next.length - 1] = { role: 'assistant', text: 'On it — opening the page…' };
       return next;
     });
+    // Everything said so far goes WITH the request. The background rebuilds its
+    // conversation from tidraChat, so seeding it with only the new message is
+    // what makes a follow-up land in an empty room: "what are these?" arrives
+    // with nothing to resolve "these" against, and the agent asks for a URL.
+    // `turns` here is still the pre-message value — this runs inside the same
+    // closure that queued the new turn — so it is exactly the prior history.
+    const prior = turns
+      .filter((t) => t.text.trim())
+      .map((t) => ({ role: t.role, text: t.text }));
     await browser.storage.local.set({
-      tidraChat: { messages: [{ role: 'user', text }], loading: true },
+      tidraChat: { messages: [...prior, { role: 'user', text }], loading: true },
       tidraPending: null,
       tidraUnread: false,
       tidraOpen: true,
@@ -658,12 +804,15 @@ function NewTab() {
       const chat = changes.tidraChat.newValue as
         | { messages?: { role: string; text: string }[]; loading?: boolean }
         | undefined;
-      const replies = (chat?.messages ?? []).filter((m) => m.role !== 'user');
-      if (!replies.length) return;
-      setTurns([
-        { role: 'user', text },
-        ...replies.map((m) => ({ role: 'assistant' as const, text: m.text })),
-      ]);
+      const msgs = chat?.messages ?? [];
+      // Nothing back yet — leave "On it…" alone rather than blanking the thread.
+      if (!msgs.some((m) => m.role !== 'user')) return;
+      // Rebuild from the WHOLE store, not just this turn's replies: tidraChat is
+      // now the conversation, and rendering a slice of it would erase on screen
+      // the same history the agent is still reasoning over.
+      setTurns(
+        msgs.map((m) => ({ role: m.role === 'user' ? ('user' as const) : ('assistant' as const), text: m.text })),
+      );
       if (chat?.loading === false) {
         setStreaming(false);
         browser.storage.onChanged.removeListener(follow);
@@ -676,7 +825,7 @@ function NewTab() {
         type: 'tidra-ask',
         prompt: text,
         page: { title: 'Tidra new tab', url: 'about:newtab', text: '' },
-        intent: 'act',
+        intent,
       })
       .catch(() => {});
   }
@@ -705,7 +854,12 @@ function NewTab() {
 
   // ── Ask-box options: Google / Chat / open a website / autocomplete ────────
   const q = input.trim();
-  const chatMode = looksLikeChat(q);
+  // Mid-conversation, there is nothing to guess: you are talking to Tidra, and
+  // the next thing you type is a reply. The heuristic only gets a say on the
+  // FIRST input, where the box genuinely is both a search bar and a chat — read
+  // any later, it sends "yes please" or "the second one" to Google and drops the
+  // conversation, because a short answer looks nothing like a question.
+  const chatMode = active || looksLikeChat(q);
   const directUrl = q ? asUrl(q) : null;
   const site = q && !directUrl ? matchSite(q, visits) : null;
 
@@ -1025,7 +1179,7 @@ function NewTab() {
                 <div key={i} className="nt-turn nt-turn-tidra">
                   <div className="nt-turn-text">
                     {t.text ? (
-                      renderRich(t.text)
+                      renderBlocks(t.text)
                     ) : (
                       <span className="nt-dots">
                         <i />
@@ -1231,7 +1385,7 @@ function NewTab() {
             </div>
           )}
 
-          {!q && (routineEnabled || routineSites.length > 0) && (
+          {!q && (routineEnabled || routineSites.length > 0 || folders.length > 0) && (
             <div
               className={
                 'nt-routine' +
@@ -1255,8 +1409,33 @@ function NewTab() {
                     </svg>
                     Add
                   </button>
+                  <button className="nt-routine-add" onClick={addFolder} title="Let Tidra read a folder on your computer">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                      <path
+                        d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"
+                        stroke="currentColor"
+                        strokeWidth="1.8"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                    Add folder
+                  </button>
                 </div>
               )}
+              {routineOpen && folders.length > 0 && (
+                <div className="nt-routine-list nt-folder-list">
+                  {folders.map((row) => (
+                    <FolderChip key={row.rec.id} row={row} onFix={fixFolder} onRemove={disconnectFolder} />
+                  ))}
+                </div>
+              )}
+              {routineOpen && folders.some((f) => f.access !== 'granted') && (
+                <p className="nt-routine-note">
+                  Chrome forgets folder access every time it restarts — the handle is still here, so one
+                  click on the folder above restores it. Tidra can't do that click for you.
+                </p>
+              )}
+              {routineOpen && folderNote && <p className="nt-routine-note">{folderNote}</p>}
               {routineOpen &&
                 (routineSites.length > 0 ? (
                   <>
@@ -1336,6 +1515,38 @@ function NewTab() {
             <p className="nt-modal-hint">
               Tidra will follow this when it runs your routine — describe it however you like.
             </p>
+
+            {/* Binding a folder is what makes "open that folder and analyse the
+                last file" resolvable — without it the routine has no idea which
+                folder "that" is. Offered only when one is connected: an empty
+                dropdown would just raise a question it can't answer. */}
+            <label className="nt-modal-label">Folder from your computer</label>
+            {folders.length > 0 ? (
+              <select
+                className="nt-modal-input nt-modal-select"
+                value={folderDraft}
+                onChange={(e) => setFolderDraft(e.target.value)}
+              >
+                <option value="">None — this routine only uses the website</option>
+                {folders.map((f) => (
+                  <option key={f.rec.id} value={f.rec.id}>
+                    {f.rec.label}
+                    {f.access === 'granted' ? '' : ' (needs reconnecting)'}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <p className="nt-modal-hint">
+                No folder connected yet. Close this and use “Add folder” if the routine should read
+                files from your computer.
+              </p>
+            )}
+            {folderDraft && (
+              <p className="nt-modal-hint">
+                Tidra can list and read this folder while the routine runs — e.g. “open that folder
+                and analyse the last file”.
+              </p>
+            )}
             <div className="nt-modal-foot">
               {taskSite ? (
                 <button className="nt-modal-open" onClick={() => go(taskSite.url)}>

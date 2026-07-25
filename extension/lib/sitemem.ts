@@ -44,14 +44,46 @@ export function domainOf(url: string | undefined): string | null {
   }
 }
 
+/**
+ * Notes Tidra knows before it has ever visited a site.
+ *
+ * These all say the same thing in different clothes: when an app has a query
+ * console, one query beats forty pages of clicking. That is not something a
+ * run can discover cheaply — it learns the click path, succeeds slowly, and
+ * saves the slow path as the recipe. So the shortcut is seeded.
+ *
+ * Matched on the registrable domain (see domainOf), and merged ahead of
+ * anything learned, which may add to it but never has to rediscover it.
+ */
+const BUILTIN_NOTES: Record<string, string[]> = {
+  'supabase.com': [
+    "For any question about the DATA itself — counts, lookups, what a given user did, anything spanning more than one table — open the SQL Editor from the left sidebar and run ONE SQL query. Never page through the Table Editor row by row. Use information_schema.columns or pg_catalog to find which tables carry a column before querying them.",
+  ],
+  'console.firebase.google.com': [
+    'Collections are browsed one document at a time, which is slow. Prefer the query bar / filter on a collection over paging, and say so if a question would need a full scan.',
+  ],
+  'metabase.com': [
+    'Use the native SQL editor ("New → SQL query") for anything a saved question does not already answer — do not rebuild it in the visual query builder.',
+  ],
+  'admin.google.com': [
+    'Reports and Audit pages accept filters directly in the URL query string; setting them there beats clicking through the filter menus.',
+  ],
+};
+
 async function loadAll(): Promise<Store> {
   const { [KEY]: v } = await browser.storage.local.get(KEY);
   return (v as Store) ?? {};
 }
 
+/** Learned memory for a domain, with its built-in notes merged in front. */
 export async function getSiteMemory(domain: string | null): Promise<SiteMemory | null> {
   if (!domain) return null;
-  return (await loadAll())[domain] ?? null;
+  const learned = (await loadAll())[domain] ?? null;
+  const builtin = BUILTIN_NOTES[domain] ?? [];
+  if (!learned) {
+    return builtin.length ? { notes: [...builtin], recipes: [], updated: 0 } : null;
+  }
+  return { ...learned, notes: [...builtin, ...learned.notes] };
 }
 
 const STOP = new Set([
@@ -68,11 +100,27 @@ function words(s: string): Set<string> {
   );
 }
 
+function hits(a: Set<string>, b: Set<string>): number {
+  let n = 0;
+  for (const w of a) if (b.has(w)) n++;
+  return n;
+}
+
+/** Similarity, measured against the LONGER text — for "are these the same?". */
 function overlap(a: Set<string>, b: Set<string>): number {
   if (!a.size || !b.size) return 0;
-  let hit = 0;
-  for (const w of a) if (b.has(w)) hit++;
-  return hit / Math.max(a.size, b.size);
+  return hits(a, b) / Math.max(a.size, b.size);
+}
+
+/**
+ * Similarity measured against the SHORTER text — for "does this add anything?".
+ * A one-line note restating part of a long one scores near 0 on overlap, since
+ * the long note's other words drown it; here it scores near 1, which is what
+ * "we already know this" actually means.
+ */
+function containment(a: Set<string>, b: Set<string>): number {
+  if (!a.size || !b.size) return 0;
+  return hits(a, b) / Math.min(a.size, b.size);
 }
 
 /** Best past recipe for this task, or null when nothing is close enough. */
@@ -124,12 +172,16 @@ export async function rememberSite(
   const all = await loadAll();
   const mem: SiteMemory = all[domain] ?? { notes: [], recipes: [], updated: 0 };
 
+  // Deduped against the built-in notes too, so a run never "learns" its way to
+  // a second, worse copy of something Tidra already knew.
+  const known = [...(BUILTIN_NOTES[domain] ?? []), ...mem.notes];
   for (const raw of notes) {
     const n = String(raw ?? '').trim().slice(0, 200);
     if (!n) continue;
     const nw = words(n);
-    const dup = mem.notes.some((old) => overlap(nw, words(old)) > 0.6);
-    if (!dup) mem.notes.push(n);
+    if (known.some((old) => containment(nw, words(old)) > 0.7)) continue;
+    mem.notes.push(n);
+    known.push(n);
   }
   mem.notes = mem.notes.slice(-MAX_NOTES);
 

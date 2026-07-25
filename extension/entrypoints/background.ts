@@ -39,6 +39,20 @@ import { reportUrl, saveReport } from '../lib/library';
 import { base64ToBlob, transcribe } from '../lib/voice';
 import { buildPdf, bytesToBase64, safeFilename, toWinAnsiText } from '../lib/pdf';
 import { extFromUrl, nameFromUrl, saveData, saveUrl } from '../lib/download';
+import {
+  findFolder,
+  folderAccess,
+  isText,
+  listFolders,
+  listTree,
+  markUsed,
+  nextUnused,
+  readFile,
+  readText,
+  statFile,
+  type FileBytes,
+  type FolderRecord,
+} from '../lib/folders';
 
 interface PageContext {
   title: string;
@@ -59,7 +73,7 @@ interface AskRequest {
   type: 'tidra-ask';
   prompt: string;
   page: PageContext;
-  intent?: 'chat' | 'act';
+  intent?: 'chat' | 'look' | 'act';
   attachments?: Attachment[];
 }
 
@@ -110,6 +124,7 @@ Tools:
 - screenshot(question): a picture of the page, answered in text — what it shows, plus pixel coordinates for anything worth clicking. Expensive — only when the snapshot genuinely isn't enough (canvas, custom widgets, layout questions) or an action failed twice and you need to see why.
 - click_at(x, y): trusted click at pixel coordinates from the latest screenshot — the way to press things that have no ref (canvas apps, custom widgets). Always screenshot first; never guess coordinates.
 - click_text(text) / type_text(text, field, submit): label-matching fallbacks for when a full snapshot isn't worth it.
+- focus_background(): offered only when you checked something for the user out of sight a moment ago (their inbox, their messages). If they now want you to ACT on what you found there — "reply to the first one", "open that one" — call this first: it brings that tab into view and continues there, so they watch the draft appear instead of wondering where it went.
 
 Documents — reports and files:
 - create_report(title, content, subtitle): write a styled report into Tidra's library and open it in a tab. Reach for it when the user asks for a report, a comparison, research, a plan, a briefing — anything better read as a document than a chat bubble. content is markdown (# headings, - bullets, tables, **bold**) and it IS the whole document, so write it in full. For a quick question, just answer in chat.
@@ -352,6 +367,86 @@ const TOOLS: Tool[] = [
     input_schema: { type: 'object', properties: {} },
   },
   {
+    name: 'list_folder_files',
+    description:
+      "List what is in a folder the user connected from their computer — names, sizes and subfolders only, never the contents of the files. Use this to find the file you need before attach_file or read_folder_file. Pass `path` to look inside one subfolder rather than listing everything. If nothing is connected, tell the user to connect a folder from Tidra's new tab — you cannot do it for them.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        folder: {
+          type: 'string',
+          description:
+            'Which connected folder, by the name the user gave it. Omit when only one is connected.',
+        },
+        path: {
+          type: 'string',
+          description: 'A subfolder to look inside, e.g. "june". Omit for the top level.',
+        },
+        images_only: {
+          type: 'boolean',
+          description:
+            'Narrow the listing to pictures and videos only. Default false — list everything, because the user asking "what is in this folder" means everything in it.',
+        },
+        depth: {
+          type: 'number',
+          description: 'How many levels of subfolder to descend. Default 2, max 5.',
+        },
+        sort: {
+          type: 'string',
+          enum: ['name', 'newest'],
+          description:
+            'Order of the listing. Use "newest" for "the last file", "the latest one", "what was just added" — it sorts by when each file was last changed, most recent first. Default "name".',
+        },
+      },
+    },
+  },
+  {
+    name: 'read_folder_file',
+    description:
+      "Read ONE text file out of a connected folder — a caption, a script, a CSV, some notes. Only call this for the specific file you need: the contents come back into the conversation, so reading a folder file-by-file is wasteful and usually unnecessary. Pictures, videos and PDFs cannot be read this way; to put a picture on a page, use attach_file instead.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        folder: { type: 'string', description: 'Which connected folder. Omit when only one is connected.' },
+        file: {
+          type: 'string',
+          description: 'Path from list_folder_files, e.g. "captions.txt" or "june/notes.md".',
+        },
+      },
+      required: ['file'],
+    },
+  },
+  {
+    name: 'attach_file',
+    description:
+      "Upload a file from a connected folder into the page's file input — a post composer's photo attachment, an email attachment, an avatar. This replaces clicking the page's \"Add photo\" button, which would open an OS dialog you cannot use: open the composer first, then call this. Omit `file` to take the next one the user hasn't used yet, which is what a daily \"post a picture from this folder\" routine wants. Attaching is not posting — you still stop and call confirm_action before publishing.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        folder: {
+          type: 'string',
+          description: 'Which connected folder. Omit when only one is connected.',
+        },
+        file: {
+          type: 'string',
+          description:
+            "Path from list_folder_files, e.g. \"monday.png\" or \"june/monday.png\". Omit to take the next file the user hasn't used yet.",
+        },
+        ref: {
+          type: 'string',
+          description:
+            'Optional ref of the attach button or upload area, to disambiguate when the page has several uploads (avatar vs post). The real file input is usually hidden, so leaving this out is normal.',
+        },
+      },
+    },
+  },
+  {
+    name: 'focus_background',
+    description:
+      "Bring the tab Tidra last checked in the background to the front, and continue working there. Use it when the user follows up on something you looked up for them out of sight — “reply to the first one”, “open that email”, “connect with him” — so the work happens on the page they found, and they can watch you do it. Returns that page's snapshot; refs from any earlier snapshot go stale.",
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
     name: 'confirm_action',
     description:
       'Call this AFTER drafting/filling everything, right before an irreversible action (send email, publish post, submit, buy, delete). It pauses and shows the user a Confirm/Cancel bar. Do not click the Send/Post button yourself — call this instead and wait.',
@@ -415,6 +510,32 @@ async function profilePreamble(): Promise<string> {
   add('Notes', p.about);
   if (!bits.length) return '';
   return `\n\nAbout the user (from their own profile — use it for their voice, sign-offs and tone):\n${bits.join('\n')}`;
+}
+
+/**
+ * The folders the user has connected, named in the system prompt.
+ *
+ * Without this the model has the folder tools but no idea any folder exists, so
+ * "read all files in kindezuschlag" reads as a word it doesn't recognise rather
+ * than a folder it can open — and the honest-looking move becomes asking the
+ * user what's in it. Naming them costs a line and removes the guess.
+ */
+async function foldersPreamble(): Promise<string> {
+  const all = await listFolders().catch(() => []);
+  if (!all.length) return '';
+  const rows = await Promise.all(
+    all.map(async (f) => {
+      const ok = (await folderAccess(f)) === 'granted';
+      return `- "${f.label}"${ok ? '' : ' (currently unreadable — the user must click Reconnect on it in the Tidra new tab)'}`;
+    }),
+  );
+  return [
+    '',
+    '',
+    "Folders on the user's computer they have connected to Tidra:",
+    ...rows,
+    'When they mention one of these by name — or say "my folder", "that folder", "my files" — it is one of these. Use list_folder_files / read_folder_file / attach_file. Never ask the user what is inside one; look.',
+  ].join('\n');
 }
 
 function extractText(content: ContentBlock[]): string {
@@ -712,6 +833,8 @@ function statusFor(tool: string, input: any): string {
     }
     case 'get_page':
       return 'Reading the page';
+    case 'focus_background':
+      return 'Bringing it up for you';
     case 'create_report':
       return 'Writing the report';
     case 'create_pdf':
@@ -740,16 +863,17 @@ async function pushChat(text: string, role: 'assistant' | 'error') {
   await browser.storage.local.set({ tidraChat: chat, tidraUnread: true, tidraStatus: null });
 }
 
-// Cheap Haiku router: decide "act" (needs browser tools) vs "chat" (answer
-// about the page). Uses only the prompt + a little history — no page text —
-// so it's a few dozen tokens. Errs toward "act" so capability isn't lost.
+// Cheap router: chat (no browser) / look (browser, read-only → runs hidden) /
+// act (browser, changes or drafts something → runs where the user can watch).
+// Uses only the prompt + a little history — no page text — so it's a few dozen
+// tokens. Errs toward "act" so neither capability nor visibility is lost.
 async function classify(
   apiKey: string,
   routerModel: string,
   prompt: string,
   history: ChatMsg[],
   signal?: AbortSignal,
-): Promise<'chat' | 'act'> {
+): Promise<'chat' | 'look' | 'act'> {
   try {
     const recent = history
       .slice(-4)
@@ -762,38 +886,55 @@ async function classify(
       max_tokens: 5,
       system:
         [
-          'Reply with exactly one word: act or chat.',
+          'Reply with exactly one word: look, act or chat.',
           '',
-          'act — answering needs the browser. That covers doing things (open, go, search, click, type, reply, post, fill, buy, download a file, save something as a PDF) AND looking things up that only exist behind a website or the user\'s own account: their inbox, messages, notifications, orders, calendar, profile, feed, or anything current on a specific site.',
+          'look — the user wants to KNOW something that lives behind a website, their own account, or a folder on their computer they connected to Tidra, and the answer comes back as information. Checking mail, messages, notifications, orders or a feed; looking up a price, a status, a fact on a site; listing what is in one of their folders, reading one of their files, finding the newest one. NOTHING is written, sent, filled in or changed, and the answer is text.',
           '',
-          'chat — can be answered from general knowledge alone, or is about text already in this conversation.',
+          'act — the request CHANGES something, or produces something the user has to look at and approve: replying, writing, posting, commenting, filling a form, connecting, buying, downloading, saving a PDF or a report. ALSO anything about the page the user is looking at right now — "this page", "this post", "this email", "summarise this".',
+          '',
+          'chat — answerable from general knowledge alone, or about text already in this conversation.',
           '',
           'Being phrased as a question does NOT make it chat. Examples:',
-          '"do I have new messages on LinkedIn?" -> act',
-          '"what did Marco reply?" -> act',
-          '"any new emails?" -> act',
+          '"any new emails?" -> look',
+          '"do I have new messages on LinkedIn?" -> look',
+          '"what did Marco reply?" -> look',
+          '"check my notifications" -> look',
+          '"how much is the iPhone on amazon?" -> look',
+          '"did my order ship?" -> look',
+          '"read all files in kindezuschlag" -> look',
+          '"what is in my photos folder?" -> look',
+          '"open that folder and analyse the last file" -> look',
+          '"reply to Marco" -> act',
+          '"attach the latest pdf from my folder to this email" -> act',
+          '"post the next picture from my folder to LinkedIn" -> act',
+          '"answer this post" -> act',
           '"summarise this page" -> act',
           '"make a pdf of this page" -> act',
           '"download this image" -> act',
-          '"save that as a pdf" -> act',
+          '"write a post about our launch" -> act',
           '"what is the capital of Albania?" -> chat',
           '"rewrite that paragraph more formally" -> chat',
           '',
-          'If unsure, answer act.',
+          'If unsure between look and act, answer act. If unsure whether the browser is needed at all, answer look.',
         ].join('\n'),
       messages: [
         {
           role: 'user',
-          content: `${recent ? recent + '\n' : ''}Request: ${prompt}\nAnswer (act or chat):`,
+          // All three options, every time. This used to end "(act or chat)",
+          // which quietly argued against `look` — the one route that had just
+          // been added — in the very last thing the model reads.
+          content: `${recent ? `Conversation so far:\n${recent}\n\n` : ''}Request: ${prompt}\nAnswer (look, act or chat):`,
         },
       ],
       },
       signal,
     );
     const t = extractText(res.content).toLowerCase();
-    return t.includes('chat') ? 'chat' : 'act';
+    if (t.includes('chat')) return 'chat';
+    if (t.includes('look')) return 'look';
+    return 'act';
   } catch {
-    return 'act'; // safe default: keep full capability
+    return 'act'; // safe default: keep full capability, and stay visible
   }
 }
 
@@ -975,6 +1116,81 @@ async function ensureAgentTab(): Promise<number | undefined> {
   return tab.id;
 }
 
+/**
+ * Where a background "look" left off. A check ("any new mail?") reads a site
+ * without the user watching; the follow-up ("reply to the first one") is about
+ * what it found there, not about the page in front of them — so the act run is
+ * offered focus_background to pick that tab up and bring it into view.
+ */
+interface BgContext {
+  tabId: number;
+  url: string;
+  title: string;
+  at: number;
+}
+const BG_FRESH_MS = 20 * 60 * 1000;
+
+async function saveBgContext(tabId: number | undefined): Promise<void> {
+  if (tabId == null) return;
+  const tab = await browser.tabs.get(tabId).catch(() => null);
+  if (!tab?.url || !/^https?:/i.test(tab.url)) return;
+  const ctx: BgContext = { tabId, url: tab.url, title: tab.title ?? '', at: Date.now() };
+  await browser.storage.session.set({ tidraBg: ctx });
+}
+
+/** The last background look, if it is recent and its tab still exists. */
+async function freshBgContext(): Promise<BgContext | null> {
+  const { tidraBg } = await browser.storage.session.get('tidraBg');
+  const ctx = tidraBg as BgContext | undefined;
+  if (!ctx?.tabId || Date.now() - ctx.at > BG_FRESH_MS) return null;
+  const tab = await browser.tabs.get(ctx.tabId).catch(() => null);
+  return tab?.id == null ? null : ctx;
+}
+
+const folderGone = (label: string) =>
+  `The folder "${label}" can't be read any more — it was probably moved, renamed or deleted. Tell the user to connect it again from a Tidra new tab.`;
+
+/**
+ * Pick the folder a tool call means, or explain — to the model, in words it can
+ * relay — why it can't have it.
+ *
+ * The worker shares IndexedDB with the extension's pages, so the handles are
+ * right here. What it does NOT share is the ability to win the permission back:
+ * that needs a picker and a click, both of which only exist in a page. So a
+ * lapsed folder is never retried here — it is handed back as something for the
+ * user to fix in one click, which is the honest description of it.
+ */
+async function resolveFolder(query?: string): Promise<{ rec: FolderRecord } | { error: string }> {
+  const all = await listFolders();
+  if (!all.length) {
+    return {
+      error:
+        'No folder from the computer is connected. Tell the user to open a Tidra new tab and click "Add folder" — a folder picker can only be opened by them, never by you.',
+    };
+  }
+  const rec = await findFolder(query);
+  if (!rec) {
+    const names = all.map((f) => `"${f.label}"`).join(', ');
+    return {
+      error: query
+        ? `No connected folder matches "${query}". Connected: ${names}.`
+        : `More than one folder is connected (${names}) — ask the user which one.`,
+    };
+  }
+  const access = await folderAccess(rec);
+  if (access === 'missing') {
+    return {
+      error: `The folder "${rec.label}" can't be reached any more — it was probably moved, renamed or deleted. The user needs to connect it again from the new tab.`,
+    };
+  }
+  if (access !== 'granted') {
+    return {
+      error: `Access to "${rec.label}" has lapsed — Chrome drops folder permission when the browser restarts. Tell the user to open a Tidra new tab and click "Reconnect" on that folder; it is one click and they don't have to find the folder again.`,
+    };
+  }
+  return { rec };
+}
+
 async function execTool(
   name: string,
   input: any,
@@ -1090,6 +1306,135 @@ async function execTool(
       return { content: `Saved "${result.filename ?? filename}" to the Downloads folder.`, isError: false };
     }
 
+    // Reading a connected folder needs no page at all, so it runs before the
+    // "is there a web page here" guard — the user can ask what's in a folder
+    // from the new tab, where no content script exists.
+    if (name === 'list_folder_files') {
+      const found = await resolveFolder(input?.folder);
+      if ('error' in found) return { content: found.error, isError: true };
+      const imagesOnly = input?.images_only === true;
+      const where = String(input?.path ?? '').trim();
+      // A folder deleted or renamed on disk still reports its permission as
+      // granted — the handle only breaks when something actually reads it.
+      const sort = input?.sort === 'newest' ? 'newest' : 'name';
+      const listing = await listTree(found.rec, {
+        imagesOnly,
+        sort,
+        sub: where || undefined,
+        depth: Math.min(5, Math.max(1, Number(input?.depth) || 2)),
+      }).catch(() => null);
+      if (!listing) {
+        return {
+          content: where
+            ? `There is no subfolder "${where}" in "${found.rec.label}".`
+            : folderGone(found.rec.label),
+          isError: true,
+        };
+      }
+
+      const scope = `"${found.rec.label}"${where ? `/${where}` : ''}`;
+      if (!listing.files.length) {
+        // "Empty" is a claim about the folder; the filter having matched nothing
+        // is a claim about the filter. Reporting the second as the first is how
+        // a folder of nine PDFs gets described to the user as empty.
+        if (imagesOnly) {
+          const all = await listTree(found.rec, { sub: where || undefined, cap: 1 }).catch(() => null);
+          if (all?.files.length) {
+            return {
+              content: `${scope} has no pictures or videos in it, but it is NOT empty — there are other files. Call again with images_only false to see them.`,
+              isError: false,
+            };
+          }
+        }
+        if (!listing.dirs.length) return { content: `${scope} is empty.`, isError: false };
+      }
+      const lines = listing.files.map(
+        (f) =>
+          `${f.path} — ${Math.max(1, Math.round(f.size / 1024))} KB, changed ${new Date(f.modified).toISOString().slice(0, 16).replace('T', ' ')}${f.used ? ' (already used)' : ''}`,
+      );
+      const fresh = listing.files.filter((f) => !f.used).length;
+      const notes: string[] = [];
+      if (listing.dirs.length) notes.push(`Subfolders: ${listing.dirs.join(', ')}`);
+      if (imagesOnly) notes.push('Only pictures and videos were listed — other file types are hidden.');
+      if (listing.omitted) {
+        notes.push(
+          `${listing.omitted} more file${listing.omitted > 1 ? 's are' : ' is'} in here but not listed — narrow it with \`path\` if you need them.`,
+        );
+      }
+      if (listing.unexplored.length) {
+        notes.push(
+          `Not descended into: ${listing.unexplored.join(', ')} — pass one as \`path\` to look inside.`,
+        );
+      }
+      return {
+        content: [
+          `${scope} — ${listing.files.length} file${listing.files.length === 1 ? '' : 's'} listed${sort === 'newest' ? ', most recently changed FIRST' : ''}, ${fresh} not yet used. This is names, sizes and dates only; use read_folder_file for the contents of one text file, or attach_file to upload one to the page.`,
+          '',
+          ...lines,
+          ...(notes.length ? ['', ...notes] : []),
+        ].join('\n'),
+        isError: false,
+      };
+    }
+
+    if (name === 'read_folder_file') {
+      const found = await resolveFolder(input?.folder);
+      if ('error' in found) return { content: found.error, isError: true };
+      const path = String(input?.file ?? '').trim();
+      if (!path) return { content: 'Pass the file to read as `file`.', isError: true };
+      if (!isText(path)) {
+        // Being specific about PDFs matters — "not a text file" reads like a
+        // quibble about the extension, and the user tries again with the same
+        // file. Tidra can hand a PDF to a page; it cannot read one.
+        const pdf = /\.pdf$/i.test(path);
+        return {
+          content: pdf
+            ? `Tidra cannot read the text inside a PDF — it can only create PDFs, not open them. It CAN upload "${path}" to a page with attach_file. Tell the user plainly that reading the contents of their PDFs is not something Tidra can do yet.`
+            : `"${path}" is not a text file, so its contents would be meaningless as text. To put it on a page, use attach_file.`,
+          isError: true,
+        };
+      }
+      const read = await readText(found.rec, path).catch(() => null);
+      if (!read) {
+        return {
+          content: `There is no file called "${path}" in "${found.rec.label}" — call list_folder_files to see what is there.`,
+          isError: true,
+        };
+      }
+      return {
+        content: read.truncated
+          ? `${read.name} (first part only — the file is ${Math.round(read.size / 1024)} KB and was cut off):\n\n${read.text}`
+          : `${read.name}:\n\n${read.text}`,
+        isError: false,
+      };
+    }
+
+    // Hand the conversation over to the tab a background check left open, and
+    // show it to the user — from here on they watch the work happen.
+    if (name === 'focus_background') {
+      const ctx = await freshBgContext();
+      if (!ctx) {
+        return {
+          content:
+            'There is no background tab to switch to. Work on the current page, or open_url what you need.',
+          isError: true,
+        };
+      }
+      const tab = await browser.tabs.get(ctx.tabId).catch(() => null);
+      if (tab?.id == null) return { content: 'That background tab is gone.', isError: true };
+      await browser.tabs.update(tab.id, { active: true }).catch(() => {});
+      if (tab.windowId != null) {
+        await browser.windows.update(tab.windowId, { focused: true }).catch(() => {});
+      }
+      tabState.tabId = tab.id;
+      await sleep(400);
+      const tree = await snapshotAllFrames(tab.id);
+      return {
+        content: `Now on ${tab.title ?? ''} — ${tab.url ?? ctx.url}, and the user can see it. These refs are fresh.\n\n${tree}`,
+        isError: false,
+      };
+    }
+
     if (name === 'open_url') {
       let url: string = String(input.url || '');
       if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
@@ -1119,6 +1464,61 @@ async function execTool(
       return {
         content: 'There is no web page open in this tab yet. Call open_url first to go to the site.',
         isError: true,
+      };
+    }
+
+    if (name === 'attach_file') {
+      const found = await resolveFolder(input?.folder);
+      if ('error' in found) return { content: found.error, isError: true };
+      const rec = found.rec;
+
+      let wanted = String(input?.file ?? '').trim();
+      if (!wanted) {
+        const next = await nextUnused(rec).catch(() => undefined);
+        if (next === undefined) return { content: folderGone(rec.label), isError: true };
+        if (!next) {
+          return {
+            content: `Every file in "${rec.label}" has been used already. Tell the user to add new ones to the folder, or name a specific file to reuse.`,
+            isError: true,
+          };
+        }
+        wanted = next.path;
+      }
+
+      const stat = await statFile(rec, wanted).catch(() => null);
+      if (!stat) {
+        return {
+          content: `There is no file called "${wanted}" in "${rec.label}" — call list_folder_files to see what is there.`,
+          isError: true,
+        };
+      }
+      // Checked before the read, not after: base64 roughly doubles the bytes and
+      // the whole thing sits in the worker's memory on the way to the page.
+      if (stat.size > 20 * 1024 * 1024) {
+        return {
+          content: `"${wanted}" is ${Math.round(stat.size / (1024 * 1024))} MB — too big to hand to the page. Ask the user for a smaller file.`,
+          isError: true,
+        };
+      }
+      const file: FileBytes = await readFile(rec, wanted);
+
+      const res = await sendAction(tabState.tabId, {
+        type: 'tidra-action',
+        action: 'attach_file',
+        name: file.name,
+        mime: file.mime,
+        base64: file.base64,
+        ref: input?.ref,
+      });
+      if (!res?.ok) {
+        return { content: String(res?.error ?? 'The page would not take the file.'), isError: true };
+      }
+      // Marked used only once it actually landed on the page, so a failed
+      // attach doesn't quietly burn tomorrow's picture.
+      await markUsed(rec, wanted);
+      return {
+        content: `${String(res.data)} (from "${rec.label}"). It is attached, NOT posted — draft the rest, then call confirm_action before publishing.`,
+        isError: false,
       };
     }
 
@@ -1399,12 +1799,24 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   try {
   // Repeated work over many targets can't run as one conversation — it becomes
   // a durable job instead. Only "act" requests are ever candidates.
+  //
+  // The detector judges the recent THREAD, not just the newest message. "Add
+  // 10 connections" → clarifying question → "no criteria, random": the count
+  // lives two turns back, and a batch judged only on the reply slips into the
+  // normal agent, which then runs out of steps ten items in.
+  const threadPrompt =
+    history.length > 1
+      ? history
+          .slice(-5)
+          .map((m) => `${m.role === 'user' ? 'User' : 'Tidra'}: ${m.text.slice(0, 400)}`)
+          .join('\n')
+      : message.prompt;
   if (
     intent !== 'chat' &&
     (await maybeStartJob(
       apiKey,
       tier,
-      expandedPrompt ? { ...message, prompt: expandedPrompt } : message,
+      { ...message, prompt: expandedPrompt ?? threadPrompt },
       abort.signal,
     ))
   ) {
@@ -1413,8 +1825,32 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   }
 
   // Decide route: explicit hint (quick actions, a skill's mode) or the cheap router.
-  const route: 'chat' | 'act' =
+  const route: 'chat' | 'look' | 'act' =
     intent ?? (await classify(apiKey, tier.router, expandedPrompt ?? message.prompt, history, abort.signal));
+  // Both browser routes drive the same agent loop with the same tools. What
+  // separates them is WHERE: a look works in Tidra's hidden tab and comes back
+  // with an answer, an act works where the user can watch it.
+  const browsing = route === 'act' || route === 'look';
+  if (route === 'look') {
+    tabState.tabId = await ensureAgentTab();
+    // The user's page isn't where this runs and isn't what it's about, so the
+    // whole page dump comes out of the prompt — one line of context is enough,
+    // and a look stops paying for text it will never use.
+    const last = messages[messages.length - 1];
+    if (typeof last?.content === 'string' && last.content.startsWith('Current page:')) {
+      messages[messages.length - 1] = {
+        role: 'user',
+        content: [
+          `(For context only — the user is looking at "${message.page.title}" (${message.page.url}). Do not act on it.)`,
+          ``,
+          `Request: ${expandedPrompt ?? lastUserText}`,
+        ].join('\n'),
+      };
+    }
+  }
+  // A recent background check the user may now be following up on ("reply to
+  // the first one") — the act run can pick that tab up with focus_background.
+  const bgCtx = route === 'act' ? await freshBgContext() : null;
 
   // Attachments ride on the newest user turn. Text files are inlined; images
   // become image blocks, which only the vision model can actually read.
@@ -1448,9 +1884,9 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   // An attached image forces the vision model — it is the only one that can see
   // it, and it supports tools too, so the agent loop still works.
   const actModel =
-    images.length ? GROQ_MODELS.vision : route === 'act' ? (tier.actStart ?? tier.act) : tier.chat;
-  // The cascade may only climb within the plain act path — never off vision.
-  const canEscalate = route === 'act' && !images.length && actModel !== tier.act;
+    images.length ? GROQ_MODELS.vision : browsing ? (tier.actStart ?? tier.act) : tier.chat;
+  // The cascade may only climb within the plain browser path — never off vision.
+  const canEscalate = browsing && !images.length && actModel !== tier.act;
   // Screenshots are offered to every act model: one that can see gets the image
   // itself, the rest get the vision model's text answer (see the screenshot
   // handler in execTool).
@@ -1459,47 +1895,85 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   // request right up until the moment it isn't, and the router should not be
   // able to lose the document.
   screenshotDirect = supportsVision(actModel);
-  const tools: any[] =
-    route === 'act'
-      ? TOOLS
-      : TOOLS.filter((t) => t.name === 'create_pdf' || t.name === 'create_report');
+  const tools: any[] = !browsing
+    ? TOOLS.filter((t) => t.name === 'create_pdf' || t.name === 'create_report')
+    : TOOLS.filter((t) => {
+        // An unfocused tab cannot be captured, so a look gets no eyes — and it
+        // confirms nothing, because it sends nothing.
+        if (route === 'look') {
+          return !['screenshot', 'click_at', 'confirm_action', 'focus_background'].includes(t.name);
+        }
+        // Only offer the hand-over when there is actually a tab behind it.
+        return t.name !== 'focus_background' || !!bgCtx;
+      });
 
   // Site memory: what past runs learned about this domain, plus the step path
   // of a similar task that succeeded here. Appended to the newest USER message,
   // never the system prompt — the system prompt stays byte-identical across
   // runs so Groq's automatic prefix cache (50% off cached input) keeps hitting.
-  let actDomain = domainOf(message.page.url);
-  if (route === 'act') {
-    const hint = siteHint(await getSiteMemory(actDomain), expandedPrompt ?? lastUserText);
-    if (hint) {
+  // A look starts on a blank tab and picks its own site, so there is no domain
+  // to look memory up under yet — the first open_url fills this in, and the
+  // run is learned from under whatever site it actually visited.
+  let actDomain = route === 'look' ? null : domainOf(message.page.url);
+  if (browsing) {
+    const extra: string[] = [];
+    const hint = actDomain
+      ? siteHint(await getSiteMemory(actDomain), expandedPrompt ?? lastUserText)
+      : '';
+    if (hint) extra.push(hint);
+    if (bgCtx) {
+      extra.push(
+        `\n\nYou checked “${bgCtx.title}” (${bgCtx.url}) in a background tab a moment ago. If this request is about what you found THERE rather than the page above, call focus_background first — it brings that tab into view so the user can watch — and carry on from it.`,
+      );
+    }
+    if (extra.length) {
       const last = messages[messages.length - 1];
-      if (typeof last.content === 'string') last.content += hint;
-      else (last.content as ContentBlock[]).push({ type: 'text', text: hint });
+      const text = extra.join('');
+      if (typeof last.content === 'string') last.content += text;
+      else (last.content as ContentBlock[]).push({ type: 'text', text });
     }
   }
 
-  const profileText = await profilePreamble();
+  const profileText = (await profilePreamble()) + (await foldersPreamble());
   const modeNote = autoMode
     ? '\n\nAUTO MODE IS ON for this request: the user has already approved irreversible actions in advance. Do not call confirm_action and do not ask — finish the job, including the final click, then report what you did.'
     : '';
+  // A look is a fact-finding trip, not a visit: the user is on another page and
+  // never sees this tab, so there is nobody to show a draft to or ask.
+  const lookNote =
+    route === 'look'
+      ? `\n\nBACKGROUND MODE for this request. Your tools are pointed at a SEPARATE, hidden tab — not at the page described above. That page is only what the user happens to be looking at; it is context, and you are not on it. So:
+- START with open_url for the site the question is about. Your tab is blank until you do — a snapshot before that shows nothing.
+- Look things up, read, and REPORT. Do not write, fill in, send, post, connect, buy or change anything. If the request turns out to need that, say what you found and what the next step would be instead of doing it.
+- You cannot take screenshots here, and pressing Enter to submit a form is refused. To search, open_url a search URL (https://www.google.com/search?q=… , or the site's own ?q= URL) rather than typing into a search box.
+- Finish with the ANSWER in plain text — what you found, concretely, with the details that matter (names, subjects, times, numbers). No narration of the steps you took, and never say you cannot access a site: open it.`
+      : '';
   const base = {
     model: actModel,
     max_tokens: 2048,
     // Mechanical page steps don't need chain-of-thought; drafting rides on the
     // same calls, so only the small act model runs at low effort — the big
     // model (quality tier, or after an escalation) thinks at its default depth.
-    reasoning_effort:
-      route === 'act' && actModel === GROQ_MODELS.small ? ('low' as const) : undefined,
-    system: SYSTEM_PROMPT + profileText + modeNote,
+    reasoning_effort: browsing && actModel === GROQ_MODELS.small ? ('low' as const) : undefined,
+    system: SYSTEM_PROMPT + profileText + modeNote + lookNote,
   };
 
-  await setStatus(route === 'act' ? 'Getting started' : 'Thinking');
+  await setStatus(
+    route === 'look' ? 'Checking in the background' : route === 'act' ? 'Getting started' : 'Thinking',
+  );
 
   const snapshotIds = new Set<string>();
   // What actually happened, for site memory. And the cascade's stall counter:
   // consecutive rounds whose actions all failed or changed nothing.
   const trace: string[] = [];
+  // Domains whose site notes have already been handed over, so a run that
+  // bounces between pages is told each site's quirks exactly once.
+  const hinted = new Set<string>(actDomain ? [actDomain] : []);
   let badStreak = 0;
+  // One automatic second wind: a task that exhausts its steps mid-work gets a
+  // compacted transcript and a fresh budget once, instead of stopping.
+  let extended = false;
+  for (;;) {
   let guard = 0;
   while (guard++ < 30) {
     const params: any = { ...base, messages };
@@ -1512,9 +1986,12 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
     }
     if (response.stop_reason !== 'tool_use') {
       await pushChat(extractText(response.content as ContentBlock[]), 'assistant');
+      // Remember where the background check ended up, so a follow-up ("reply to
+      // the first one") can be picked up on that very page.
+      if (route === 'look') await saveBgContext(tabState.tabId);
       // Done and successful: distill what this run learned about the site.
       // Fire-and-forget — the user's answer is already out.
-      if (route === 'act' && trace.length >= 3) {
+      if (browsing && trace.length >= 3) {
         void learnFromRun(apiKey, actDomain, expandedPrompt ?? lastUserText, trace);
       }
       return;
@@ -1580,10 +2057,24 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
     for (const block of response.content as any[]) {
       if (block.type !== 'tool_use') continue;
       await setStatus(statusFor(block.name, block.input));
-      const result = await execTool(block.name, block.input, tabState, mayAct);
+      // A background look never submits, whatever the user pre-approved: there
+      // is nobody watching it, so nothing irreversible happens out of sight.
+      const result = await execTool(block.name, block.input, tabState, route !== 'look' && mayAct);
       if (SNAPSHOT_TOOLS.has(block.name)) snapshotIds.add(block.id);
       if (block.name === 'open_url' && block.input?.url) {
         actDomain = domainOf(String(block.input.url)) ?? actDomain;
+        // A look picks its own site mid-run, so its site notes can't be injected
+        // up front like an act's — they ride in on the landing page instead.
+        if (actDomain && !hinted.has(actDomain) && typeof result.content === 'string') {
+          hinted.add(actDomain);
+          const hint = siteHint(await getSiteMemory(actDomain), expandedPrompt ?? lastUserText);
+          if (hint) result.content += hint;
+        }
+      }
+      // Handing over to the background tab moves the run to that site, so what
+      // it learns is filed under that site and not the page it started on.
+      if (block.name === 'focus_background' && bgCtx) {
+        actDomain = domainOf(bgCtx.url) ?? actDomain;
       }
       trace.push(
         `${block.name}(${JSON.stringify(block.input ?? {}).slice(0, 100)}) ${
@@ -1619,6 +2110,21 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
     }
 
     await compactMessages(apiKey, messages, abort.signal);
+  }
+
+  // Out of steps. Take the second wind if it's still available.
+  if (browsing && !extended) {
+    extended = true;
+    await compactMessages(apiKey, messages, abort.signal);
+    messages.push({
+      role: 'user',
+      content:
+        'You ran out of steps but the task is not finished. Continue exactly where you left off — do not redo work that is already done — and complete what remains. If almost everything is done, wrap up and report.',
+    });
+    await setStatus('Continuing');
+    continue;
+  }
+  break;
   }
 
   await pushChat(
@@ -1688,7 +2194,9 @@ async function runSiteAgent(
   // No confirm_action / open_url — routine tasks stay on the opened tab and never
   // send. Screenshots need vision, and a background tab can't be captured anyway.
   // Nor do routines write files: nobody asked for a PDF, and the user is not
-  // watching this run.
+  // watching this run. Folders stay in, though — "post a picture from this
+  // folder every day" is a routine, and reading a folder the user connected by
+  // hand is the one filesystem touch they explicitly asked for.
   const tools = TOOLS.filter(
     (t) =>
       ![
@@ -1701,6 +2209,7 @@ async function runSiteAgent(
         'create_report',
         'download_file',
         'list_images',
+        'focus_background', // a routine runs unattended — it never grabs the screen
       ].includes(t.name),
   );
   const snapshotIds = new Set<string>();
@@ -1744,6 +2253,7 @@ async function runRoutine() {
       'tidraRoutineHidden',
       'tidraRoutineTasks',
       'tidraRoutineManual',
+      'tidraRoutineFolders',
     ]);
     const setup = await modelSetup();
     if (!setup) {
@@ -1762,11 +2272,18 @@ async function runRoutine() {
       return true;
     });
     const tasks = (store.tidraRoutineTasks as Record<string, string>) || {};
+    // Which folder each site's routine may reach into. Stored by folder id, so
+    // renaming a folder doesn't quietly unbind the routine that uses it.
+    const folderIds = (store.tidraRoutineFolders as Record<string, string>) || {};
     if (!sites.length) {
       await pushChat("You have no learned routine yet, so there's nothing to run.", 'assistant');
       return;
     }
 
+    // Deliberately NOT foldersPreamble() here. An unattended routine gets told
+    // about the one folder it was bound to, appended to its own task below —
+    // listing every connected folder would let a routine bound to one reach
+    // into another while nobody is watching.
     const profileText = await profilePreamble();
     await browser.storage.local.set({ tidraOpen: true });
     await pushChat(
@@ -1780,7 +2297,29 @@ async function runRoutine() {
     const sections: string[] = [];
     for (const site of sites) {
       const name = prettyDomain(site.domain);
-      const task = (tasks[site.domain] || defaultTaskFor(site.domain)).trim();
+      let task = (tasks[site.domain] || defaultTaskFor(site.domain)).trim();
+
+      // A routine bound to a folder gets told about it up front, so "analyse the
+      // last file" has something to resolve against. If the permission lapsed
+      // over a restart the run is NOT quietly folder-less — that would look like
+      // the routine working while ignoring half of what it was asked to do.
+      const bound = folderIds[site.domain] ? await findFolder(folderIds[site.domain]) : null;
+      if (bound) {
+        const access = await folderAccess(bound);
+        if (access === 'granted') {
+          task +=
+            `\n\nYou also have the user's folder "${bound.label}" from their computer available here. ` +
+            `Call list_folder_files with folder: "${bound.label}" to see what is in it — pass sort: "newest" when the task means the latest or most recent file. ` +
+            `read_folder_file reads one text file; attach_file uploads one to the page. Do not attach anything the task did not ask for.`;
+        } else {
+          await pushChat(
+            `**${name}** — this routine uses the folder “${bound.label}”, but Tidra can't read it right now. Click Reconnect on it in the new tab and run the routine again.`,
+            'error',
+          );
+          task += `\n\nNote: the folder "${bound.label}" this routine normally uses is NOT available in this run. Do the rest of the task and say plainly that the folder part was skipped.`;
+        }
+      }
+
       try {
         const tab = await browser.tabs.create({ url: site.url, active: false });
         if (tab.id == null) {
@@ -1851,6 +2390,7 @@ function looksBatch(prompt: string): boolean {
 
 interface JobPlan {
   batch: boolean;
+  mode?: 'act' | 'research';
   count?: number;
   task?: string;
   site?: string;
@@ -1872,10 +2412,11 @@ function extractJson<T>(text: string): T | null {
   }
 }
 
-const PLANNER_SYSTEM = `You split a user's request into a repeated unit of work, if it is one. Reply with JSON only — no prose, no code fence.
+const PLANNER_SYSTEM = `You split a user's request into a repeated unit of work, if it is one. The request may arrive as a short dialogue (User/Tidra turns) — judge what the user is asking for NOW, reading counts and details from the earlier turns. Reply with JSON only — no prose, no code fence.
 
 {
   "batch": true | false,
+  "mode": "act" | "research",
   "count": <how many times, best estimate; 0 if unknown>,
   "task": "<the instruction for ONE item, written so it reads correctly with that item's details appended>",
   "site": "<https:// URL where the work happens, or omit>",
@@ -1885,9 +2426,17 @@ const PLANNER_SYSTEM = `You split a user's request into a repeated unit of work,
   "missing": "<one short question, only when source is unknown>"
 }
 
-batch is true only for genuinely repeated work over MULTIPLE targets (3 or more). A single multi-step task ("book a flight", "reply to this email") is NOT a batch — it is one item, so batch is false.
+batch is true only for work that repeats over MULTIPLE targets (3 or more). A single multi-step task ("book a flight", "reply to this email") is NOT a batch — it is one item, so batch is false.
 
-batch is also false when the user only wants to FIND, look up, list, rank, compare, count or summarize things ("list the 3 best-selling sunglasses", "find 10 cheap flights", "show me 5 posts about X"). That is ONE research task whose ANSWER happens to be a list — there are no targets to work through, and nothing is missing. Batch means the user wants an action REPEATED on each target (message each person, reply to every email), not a numbered answer.
+mode — what repeats:
+- "act": the user wants an ACTION repeated on each target. Message each person, reply to every email, connect with all of them. irreversible is usually true.
+- "research": the user wants to KNOW something that can only be answered by visiting each target and gathering from it, then combining the findings. Nothing is changed. irreversible is always false. Set "task" to what to find out about ONE target.
+
+batch is false — a single research task, not a research batch — when ONE page, list or query would answer it: "list the 3 best-selling sunglasses", "find 10 cheap flights", "show me 5 posts about X". The answer being a list does not make it a batch; the ANSWER is a list, but there is only one place to look.
+
+batch is true with mode "research" when the answer genuinely requires opening many SEPARATE places and collecting from each: "search every table for what this user did", "go through all my open PRs and tell me which are blocked", "check each of these 20 sites for a pricing page". Each target is a separate visit, and only combining them answers the question.
+
+If the site has a query console (a SQL editor, a search/filter box, an export) that would answer the whole question at once, that is NOT a batch — it is one task. Prefer that: batch false.
 
 source — where the list of targets comes from:
 - "attachment": the user attached a file holding the list (a CSV of recipients, etc).
@@ -2059,6 +2608,19 @@ Write real content that fits this specific item. It is one of many, but the pers
 
 Work fast and finish: you have a small step budget per item. Call finish_item as soon as this item is complete, or as soon as you are sure it cannot be done. Do not ask the user questions — there is nobody watching an individual item.`;
 
+const JOB_RESEARCH_SYSTEM = `You are Tidra, working through a list of places to look. This turn examines exactly ONE of them and nothing else.
+
+You are on a background tab the user cannot see. Nobody is watching this item, and there is nothing to approve — so READ ONLY. Never click something that sends, saves, deletes, buys or changes anything; if the only way forward would change something, stop and say so.
+
+Use snapshot() to see the page (refs like ref_0-12), click(ref) to open things and go_back() to return, get_page() to read text properly. Refs go stale whenever the page changes.
+
+Your whole output is the FINDING for this one item, passed to finish_item as \`result\`:
+- Concrete and specific: names, dates, counts, subjects, values — quoted from the page, never guessed.
+- If there is nothing here for what was asked, say exactly that ("nothing for this user") — that is a useful finding, not a failure. Use status "done" for it.
+- A few sentences at most. Something else will combine every item's finding into the final answer, so write for that reader, not for a human waiting on this one.
+
+Work fast: you have a small step budget. Call finish_item as soon as you know the answer for this item.`;
+
 const JOB_SAMPLE_RULE = `\n\nTHIS ITEM IS THE SAMPLE. Draft everything, then STOP before the irreversible step — do not click Send/Post/Submit/Connect. Call confirm_action with a summary that QUOTES what you drafted, so the user can approve this one and the rest of the batch from it.`;
 
 const JOB_APPROVED_RULE = `\n\nThe user has already approved this batch, including the final send. Complete the item all the way — click the Send/Post/Submit button yourself. Do not call confirm_action.`;
@@ -2117,18 +2679,28 @@ async function runJobItem(
     },
   ];
 
+  const research = job.mode === 'research';
   const sampling = job.irreversible && !job.approved;
   const tools = [
     ...TOOLS.filter((t) => {
       if (t.name === 'screenshot' || t.name === 'click_at') return false; // a background tab cannot be captured
       if (t.name === 'create_report') return false; // 1000 items must not open 1000 tabs
+      if (t.name === 'focus_background') return false; // item 400 must not jump in front of the user
+      // Reading cannot write: the tools that change a page are simply absent,
+      // so a research sweep is read-only by construction, not by instruction.
+      if (research) {
+        return ['snapshot', 'find', 'click', 'scroll', 'get_page', 'go_back', 'open_url', 'click_text'].includes(
+          t.name,
+        );
+      }
       if (t.name === 'confirm_action') return sampling;
       return true;
     }),
     FINISH_ITEM,
   ];
-  const system =
-    JOB_ITEM_SYSTEM + profileText + (sampling ? JOB_SAMPLE_RULE : job.approved ? JOB_APPROVED_RULE : '');
+  const system = research
+    ? JOB_RESEARCH_SYSTEM
+    : JOB_ITEM_SYSTEM + profileText + (sampling ? JOB_SAMPLE_RULE : job.approved ? JOB_APPROVED_RULE : '');
 
   const snapshotIds = new Set<string>();
   const trace: string[] = [];
@@ -2238,7 +2810,7 @@ async function pumpJob(): Promise<void> {
       }
       return;
     }
-    const profileText = await profilePreamble();
+    const profileText = (await profilePreamble()) + (await foldersPreamble());
 
     for (;;) {
       let job = await loadJob();
@@ -2247,7 +2819,9 @@ async function pumpJob(): Promise<void> {
       const item = await claimNext(job);
       if (!item) {
         if (await retrySweep(job)) continue; // one sweep over reversible failures
-        await finishJob(job);
+        // The big model writes the answer: it reads every finding at once, and
+        // this is the one call in a sweep where getting it right matters most.
+        await finishJob(job, setup.apiKey, setup.tier.act);
         return;
       }
 
@@ -2298,8 +2872,68 @@ async function pumpJob(): Promise<void> {
   }
 }
 
+const SYNTHESIS_SYSTEM = `You are Tidra. A sweep just visited many places one at a time and wrote down what each one held. Turn those findings into the answer to the user's original question.
+
+- Answer the question directly, in the first line. No preamble, no "based on the findings".
+- Use ONLY what the findings say. Never invent, never fill a gap with something plausible.
+- Lead with what was actually found. Places that held nothing get one closing line at most ("nothing in the other 31"), never a list.
+- When several places hold related things, a markdown table is usually the clearest form.
+- If nothing was found anywhere, say so plainly in one line.`;
+
+/** How much of a sweep's findings the synthesis reads. Past this it is capped
+ *  and the cap is stated, rather than silently answering from a slice. */
+const SYNTH_MAX_ITEMS = 120;
+
+/**
+ * A research sweep's real output: every item's finding, combined into the
+ * answer the user actually asked for. The counts are progress, not the point.
+ */
+async function answerResearch(job: Job, items: JobItem[], apiKey: string, model: string): Promise<void> {
+  const withFindings = items.filter((i) => i.result && (i.state === 'done' || i.state === 'failed'));
+  if (!withFindings.length) {
+    await pushChat(
+      `I went through ${job.total} of them and came back with nothing usable. Worth checking I was looking in the right place.`,
+      'assistant',
+    );
+    return;
+  }
+  const used = withFindings.slice(0, SYNTH_MAX_ITEMS);
+  const digest = used.map((i) => `- ${i.label}: ${i.result}`).join('\n');
+
+  await setStatus('Putting it together');
+  const res = await callModel(apiKey, {
+    model,
+    max_tokens: 1600,
+    system: SYNTHESIS_SYSTEM,
+    messages: [
+      {
+        role: 'user',
+        content: [
+          `The user asked: ${job.goal}`,
+          ``,
+          `Findings, one per place looked at:`,
+          digest.slice(0, 60000),
+        ].join('\n'),
+      },
+    ],
+  });
+
+  const answer = extractText(res.content as ContentBlock[]).trim();
+  const notes: string[] = [];
+  if (used.length < withFindings.length) {
+    notes.push(`_Answered from the first ${used.length} of ${withFindings.length} places checked._`);
+  }
+  const failed = items.filter((i) => i.state === 'failed').length;
+  if (failed) notes.push(`_${failed} of ${job.total} couldn't be read, so anything there is missing._`);
+
+  await pushChat(
+    [answer || 'I gathered the findings but could not put an answer together from them.', ...notes].join('\n\n'),
+    'assistant',
+  );
+}
+
 /** Final report: counts first, then the handful of things that need a human. */
-async function finishJob(job: Job): Promise<void> {
+async function finishJob(job: Job, apiKey?: string, model?: string): Promise<void> {
   job.state = 'done';
   job.finishedAt = Date.now();
   job.current = undefined;
@@ -2307,6 +2941,18 @@ async function finishJob(job: Job): Promise<void> {
   await browser.alarms.clear(JOB_ALARM).catch(() => {});
 
   const items = await allItems(job);
+
+  // A sweep answers a question; a batch reports what it did to things.
+  if (job.mode === 'research' && apiKey && model) {
+    try {
+      await answerResearch(job, items, apiKey, model);
+      await setStatus(null);
+      return;
+    } catch {
+      // Fall through to the plain report rather than losing the run entirely.
+    }
+  }
+
   const failed = items.filter((i) => i.state === 'failed');
   const review = items.filter((i) => i.state === 'review');
   const lines = [`✅ Finished — ${job.done} of ${job.total} done.`];
@@ -2359,11 +3005,15 @@ async function maybeStartJob(
     return true;
   }
 
+  const mode = plan.mode === 'research' ? 'research' : 'act';
   const job = newJob({
     goal: message.prompt,
     task: plan.task,
+    mode,
     site: plan.site || (/^https?:/i.test(message.page.url) ? message.page.url : undefined),
-    irreversible: plan.irreversible !== false,
+    // Research reads and never writes, so there is no send to hold back and no
+    // sample to approve — the run is safe by construction.
+    irreversible: mode === 'act' && plan.irreversible !== false,
   });
   await saveJob(job);
   await setStatus('Building the list');
@@ -2400,18 +3050,27 @@ async function maybeStartJob(
 
   const est = estimate(job);
   const cost = est.dollars < 0.01 ? 'under a cent' : `about $${est.dollars.toFixed(2)}`;
+  const preview = `${items.slice(0, 3).map((i) => i.label).join(', ')}${
+    job.total > 3 ? `, +${job.total - 3} more` : ''
+  }`;
   await pushChat(
-    [
-      `**${job.total} item${job.total === 1 ? '' : 's'}** to work through: ${items
-        .slice(0, 3)
-        .map((i) => i.label)
-        .join(', ')}${job.total > 3 ? `, +${job.total - 3} more` : ''}.`,
-      ``,
-      `Each one: ${job.task}`,
-      ``,
-      `Roughly ${humanDuration(est.minutes)} and ${cost} in model usage.` +
-        (job.irreversible ? " I'll draft the first one and show it to you before anything is sent." : ''),
-    ].join('\n'),
+    (mode === 'research'
+      ? [
+          `**${job.total} place${job.total === 1 ? '' : 's'}** to look through: ${preview}.`,
+          ``,
+          `In each one: ${job.task}`,
+          ``,
+          `Roughly ${humanDuration(est.minutes)} and ${cost} in model usage. Nothing is changed — I read each one, then answer from everything together.`,
+        ]
+      : [
+          `**${job.total} item${job.total === 1 ? '' : 's'}** to work through: ${preview}.`,
+          ``,
+          `Each one: ${job.task}`,
+          ``,
+          `Roughly ${humanDuration(est.minutes)} and ${cost} in model usage.` +
+            (job.irreversible ? " I'll draft the first one and show it to you before anything is sent." : ''),
+        ]
+    ).join('\n'),
     'assistant',
   );
   await setStatus(null);
@@ -2607,7 +3266,10 @@ export default defineBackground(() => {
       (async () => {
         const setup = await modelSetup();
         if (!setup) return sendResponse({ route: 'chat' });
-        const route = await classify(setup.apiKey, setup.tier.router, message.prompt, []);
+        // With the conversation, "what are these?" is routable; without it, it
+        // is three words about nothing and the verdict is a coin toss.
+        const history = Array.isArray(message.history) ? (message.history as ChatMsg[]) : [];
+        const route = await classify(setup.apiKey, setup.tier.router, message.prompt, history);
         sendResponse({ route });
       })().catch(() => sendResponse({ route: 'chat' }));
       return true;
