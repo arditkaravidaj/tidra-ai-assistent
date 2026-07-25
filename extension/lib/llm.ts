@@ -65,14 +65,31 @@ export const NO_PARALLEL_TOOLS = new Set(['openai/gpt-oss-120b', 'openai/gpt-oss
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
+export interface Tier {
+  chat: string;
+  act: string;
+  router: string;
+  /**
+   * When set, act-runs START on this model and escalate to `act` only once the
+   * run stalls (see the cascade in handleAsk). Most page actions are trivial;
+   * this keeps the big model for the runs that actually need it.
+   */
+  actStart?: string;
+}
+
 /** Which model handles what, per cost tier. */
-export const TIERS: Record<string, { chat: string; act: string; router: string }> = {
+export const TIERS: Record<string, Tier> = {
   economy: { chat: GROQ_MODELS.small, act: GROQ_MODELS.small, router: GROQ_MODELS.router },
-  balanced: { chat: GROQ_MODELS.small, act: GROQ_MODELS.big, router: GROQ_MODELS.router },
+  balanced: {
+    chat: GROQ_MODELS.small,
+    act: GROQ_MODELS.big,
+    actStart: GROQ_MODELS.small,
+    router: GROQ_MODELS.router,
+  },
   quality: { chat: GROQ_MODELS.big, act: GROQ_MODELS.big, router: GROQ_MODELS.router },
 };
 
-export function tierFor(name: string | undefined) {
+export function tierFor(name: string | undefined): Tier {
   return TIERS[name || 'balanced'] || TIERS.balanced;
 }
 
@@ -87,7 +104,17 @@ export interface CallParams {
   system: string;
   messages: Message[];
   tools?: Tool[];
+  /**
+   * How much chain-of-thought to spend (GPT-OSS models only; silently dropped
+   * elsewhere). Output tokens cost 4× input, and the default is "medium" —
+   * mechanical page steps (click this, fill that) don't need it. Omit for
+   * anything where drafting quality matters.
+   */
+  reasoning_effort?: 'low' | 'medium' | 'high';
 }
+
+/** Groq accepts low/medium/high reasoning_effort on the GPT-OSS family only. */
+const EFFORT_MODELS = /^openai\/gpt-oss/;
 
 /* ── Our shape → Groq (OpenAI) shape ──────────────────────────────────────── */
 
@@ -234,6 +261,9 @@ export async function callModel(
         messages: toOpenAiMessages(params),
         tools: toOpenAiTools(params.tools),
         ...(params.tools?.length ? { tool_choice: 'auto' } : {}),
+        ...(params.reasoning_effort && EFFORT_MODELS.test(params.model)
+          ? { reasoning_effort: params.reasoning_effort }
+          : {}),
       }),
     });
 

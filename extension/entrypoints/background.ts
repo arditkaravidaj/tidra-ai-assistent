@@ -7,9 +7,11 @@ import {
   type Message,
   type ImageBlock,
   type TextBlock,
+  type Tier,
   type Tool,
   type ToolResultBlock,
 } from '../lib/llm';
+import { domainOf, getSiteMemory, rememberSite, siteHint } from '../lib/sitemem';
 import {
   MAX_ITEMS,
   allItems,
@@ -65,7 +67,7 @@ interface AskRequest {
 // without reloading the extension.
 async function modelSetup(): Promise<{
   apiKey: string;
-  tier: { chat: string; act: string; router: string };
+  tier: Tier;
 } | null> {
   const store = await browser.storage.local.get(['tidraGroqKey', 'tidraTier']);
   const apiKey = store.tidraGroqKey as string | undefined;
@@ -568,6 +570,116 @@ function pruneOldSnapshots(messages: Message[], snapshotIds: Set<string>) {
       }
       block.content = '[superseded snapshot removed — take a fresh one if you need refs]';
     }
+  }
+}
+
+// ─── Long-run compaction ────────────────────────────────────────────────────
+// Every turn re-sends the whole transcript, so a 30-step run pays for step 1's
+// output twenty-nine more times. Past this many messages, everything between
+// the opening request and the recent turns is folded into one small-model
+// summary. (This rewrites history, which costs Groq's prefix cache from that
+// point — but dropping the tokens outright beats a 50% discount on them.)
+const COMPACT_AFTER = 20;
+const COMPACT_KEEP_TAIL = 8;
+
+function resultText(content: string | (TextBlock | ImageBlock)[]): string {
+  if (typeof content === 'string') return content;
+  return content
+    .filter((b): b is TextBlock => b.type === 'text')
+    .map((b) => b.text)
+    .join(' ');
+}
+
+const COMPACT_SYSTEM = `You compress a browser agent's transcript so it can keep working with less context. In one tight paragraph, state: what the task is, what has been DONE so far (pages opened, fields filled, content drafted — quote any drafted text that must not be lost), what failed, and what remains. No preamble.`;
+
+async function compactMessages(
+  apiKey: string,
+  messages: Message[],
+  signal?: AbortSignal,
+): Promise<void> {
+  if (messages.length <= COMPACT_AFTER) return;
+  // The kept tail must start at an assistant turn, so no tool_result in it is
+  // ever separated from the tool_use call it answers.
+  let cut = messages.length - COMPACT_KEEP_TAIL;
+  while (cut < messages.length && messages[cut].role !== 'assistant') cut++;
+  if (cut <= 2 || cut >= messages.length) return;
+
+  const digest = messages
+    .slice(1, cut)
+    .map((m) => {
+      if (typeof m.content === 'string') return `${m.role}: ${m.content.slice(0, 300)}`;
+      const parts: string[] = [];
+      for (const b of m.content as any[]) {
+        if (b.type === 'text' && b.text?.trim()) parts.push(b.text.slice(0, 250));
+        if (b.type === 'tool_use') parts.push(`${b.name}(${JSON.stringify(b.input ?? {}).slice(0, 120)})`);
+        if (b.type === 'tool_result') parts.push(`→ ${resultText(b.content).slice(0, 200)}`);
+      }
+      return `${m.role}: ${parts.join(' | ')}`;
+    })
+    .join('\n');
+
+  try {
+    const res = await callModel(
+      apiKey,
+      {
+        model: GROQ_MODELS.small,
+        max_tokens: 600,
+        reasoning_effort: 'low',
+        system: COMPACT_SYSTEM,
+        messages: [{ role: 'user', content: digest.slice(0, 24000) }],
+      },
+      signal,
+    );
+    const summary = extractText(res.content);
+    if (!summary) return;
+    messages.splice(1, cut - 1, {
+      role: 'user',
+      content: `[Earlier steps, summarized to save space: ${summary}]\nContinue from the CURRENT page state — take a fresh snapshot if you need refs.`,
+    });
+  } catch {
+    // Compaction is an optimisation — a failed summary must never sink the run.
+  }
+}
+
+// ─── Learning from a finished run ───────────────────────────────────────────
+// After a successful act-run, one cheap fire-and-forget call distills what the
+// run learned about the site (notes) and the path that worked (a recipe). Both
+// are injected into the next act-run on that domain — see lib/sitemem.ts.
+
+const DISTILL_SYSTEM = `You extract reusable knowledge from a browser agent's completed run on a website. Reply with JSON only — no prose, no code fence:
+
+{"notes": ["<up to 2 short site-specific facts that would save a future run time — element labels, layout quirks, flows. Only non-obvious facts about THIS site; [] if none>"],
+ "steps": ["<the path that worked, as short imperative steps: 'click the Compose button', 'fill the To field'. Skip failed attempts and dead ends>"]}`;
+
+async function learnFromRun(
+  apiKey: string,
+  domain: string | null,
+  task: string,
+  trace: string[],
+): Promise<void> {
+  if (!domain || trace.length < 3) return;
+  try {
+    const res = await callModel(apiKey, {
+      model: GROQ_MODELS.small,
+      max_tokens: 500,
+      reasoning_effort: 'low',
+      system: DISTILL_SYSTEM,
+      messages: [
+        {
+          role: 'user',
+          content: `Task: ${task}\nSite: ${domain}\nActions taken (→ ok, ✗ failed):\n${trace.join('\n')}`.slice(0, 12000),
+        },
+      ],
+    });
+    const parsed = extractJson<{ notes?: string[]; steps?: string[] }>(extractText(res.content));
+    if (!parsed) return;
+    await rememberSite(
+      domain,
+      Array.isArray(parsed.notes) ? parsed.notes : [],
+      Array.isArray(parsed.steps) && parsed.steps.length ? { task, steps: parsed.steps } : null,
+    );
+  } catch {
+    // Learning is an optimisation — never surface a failure to the user.
   }
 }
 
@@ -1107,6 +1219,7 @@ async function execTool(
       const res = await callModel(setup.apiKey, {
         model: GROQ_MODELS.small,
         max_tokens: 400,
+        reasoning_effort: 'low',
         system:
           'You match elements in a web page\'s accessibility tree. Reply with ONLY the tree lines (verbatim, keeping their [ref_...]) that best match the query — up to 8, best match first, one per line. No commentary. If nothing plausibly matches, reply exactly: NO MATCH',
         messages: [{ role: 'user', content: `Query: ${query}\n\nTree:\n${tree.slice(0, 40000)}` }],
@@ -1329,10 +1442,15 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
     };
   }
 
-  // Chat → cheap model, no tools. Act → stronger model with the browser tools.
+  // Chat → cheap model, no tools. Act → the browser tools, starting on the
+  // tier's cheap act model when it has one (the cascade below escalates to the
+  // big one only if the run stalls — most page actions never need it).
   // An attached image forces the vision model — it is the only one that can see
   // it, and it supports tools too, so the agent loop still works.
-  const actModel = images.length ? GROQ_MODELS.vision : route === 'act' ? tier.act : tier.chat;
+  const actModel =
+    images.length ? GROQ_MODELS.vision : route === 'act' ? (tier.actStart ?? tier.act) : tier.chat;
+  // The cascade may only climb within the plain act path — never off vision.
+  const canEscalate = route === 'act' && !images.length && actModel !== tier.act;
   // Screenshots are offered to every act model: one that can see gets the image
   // itself, the rest get the vision model's text answer (see the screenshot
   // handler in execTool).
@@ -1346,6 +1464,20 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
       ? TOOLS
       : TOOLS.filter((t) => t.name === 'create_pdf' || t.name === 'create_report');
 
+  // Site memory: what past runs learned about this domain, plus the step path
+  // of a similar task that succeeded here. Appended to the newest USER message,
+  // never the system prompt — the system prompt stays byte-identical across
+  // runs so Groq's automatic prefix cache (50% off cached input) keeps hitting.
+  let actDomain = domainOf(message.page.url);
+  if (route === 'act') {
+    const hint = siteHint(await getSiteMemory(actDomain), expandedPrompt ?? lastUserText);
+    if (hint) {
+      const last = messages[messages.length - 1];
+      if (typeof last.content === 'string') last.content += hint;
+      else (last.content as ContentBlock[]).push({ type: 'text', text: hint });
+    }
+  }
+
   const profileText = await profilePreamble();
   const modeNote = autoMode
     ? '\n\nAUTO MODE IS ON for this request: the user has already approved irreversible actions in advance. Do not call confirm_action and do not ask — finish the job, including the final click, then report what you did.'
@@ -1353,12 +1485,21 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   const base = {
     model: actModel,
     max_tokens: 2048,
+    // Mechanical page steps don't need chain-of-thought; drafting rides on the
+    // same calls, so only the small act model runs at low effort — the big
+    // model (quality tier, or after an escalation) thinks at its default depth.
+    reasoning_effort:
+      route === 'act' && actModel === GROQ_MODELS.small ? ('low' as const) : undefined,
     system: SYSTEM_PROMPT + profileText + modeNote,
   };
 
   await setStatus(route === 'act' ? 'Getting started' : 'Thinking');
 
   const snapshotIds = new Set<string>();
+  // What actually happened, for site memory. And the cascade's stall counter:
+  // consecutive rounds whose actions all failed or changed nothing.
+  const trace: string[] = [];
+  let badStreak = 0;
   let guard = 0;
   while (guard++ < 30) {
     const params: any = { ...base, messages };
@@ -1371,6 +1512,11 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
     }
     if (response.stop_reason !== 'tool_use') {
       await pushChat(extractText(response.content as ContentBlock[]), 'assistant');
+      // Done and successful: distill what this run learned about the site.
+      // Fire-and-forget — the user's answer is already out.
+      if (route === 'act' && trace.length >= 3) {
+        void learnFromRun(apiKey, actDomain, expandedPrompt ?? lastUserText, trace);
+      }
       return;
     }
 
@@ -1436,6 +1582,14 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
       await setStatus(statusFor(block.name, block.input));
       const result = await execTool(block.name, block.input, tabState, mayAct);
       if (SNAPSHOT_TOOLS.has(block.name)) snapshotIds.add(block.id);
+      if (block.name === 'open_url' && block.input?.url) {
+        actDomain = domainOf(String(block.input.url)) ?? actDomain;
+      }
+      trace.push(
+        `${block.name}(${JSON.stringify(block.input ?? {}).slice(0, 100)}) ${
+          result.isError ? `✗ ${resultText(result.content as any).slice(0, 60)}` : '→ ok'
+        }`,
+      );
       toolResults.push({
         type: 'tool_result',
         tool_use_id: block.id,
@@ -1449,6 +1603,22 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
     }
     messages.push({ role: 'user', content: toolResults });
     pruneOldSnapshots(messages, snapshotIds);
+
+    // The cascade: if the cheap model keeps swinging and missing — or the run
+    // is dragging on — hand the same conversation to the big model. Nothing
+    // else changes; it picks up exactly where the small one left off.
+    const allBad = toolResults.every(
+      (r) =>
+        r.is_error || /no visible change|stale/i.test(resultText(r.content as any).slice(0, 400)),
+    );
+    badStreak = allBad ? badStreak + 1 : 0;
+    if (canEscalate && base.model !== tier.act && (badStreak >= 2 || guard >= 12)) {
+      base.model = tier.act;
+      base.reasoning_effort = undefined;
+      await setStatus('Thinking harder');
+    }
+
+    await compactMessages(apiKey, messages, abort.signal);
   }
 
   await pushChat(
@@ -1539,6 +1709,8 @@ async function runSiteAgent(
     const res = await callModel(apiKey, {
       model: actModel,
       max_tokens: 1500,
+      // Routines are simple, repeated site tasks — no chain-of-thought needed.
+      reasoning_effort: 'low',
       system: ROUTINE_SYSTEM + profileText,
       messages,
       tools,
@@ -1820,7 +1992,15 @@ async function collectItems(
   const snapshotIds = new Set<string>();
   let guard = 0;
   while (guard++ < 16) {
-    const res = await callModel(apiKey, { model, max_tokens: 2000, system: COLLECT_SYSTEM, messages, tools });
+    const res = await callModel(apiKey, {
+      model,
+      max_tokens: 2000,
+      // Collecting is mechanical reading — no chain-of-thought needed.
+      reasoning_effort: 'low',
+      system: COLLECT_SYSTEM,
+      messages,
+      tools,
+    });
     if (res.stop_reason !== 'tool_use') return [];
 
     const recorded = (res.content as any[]).find((b) => b.type === 'tool_use' && b.name === 'record_items');
@@ -1890,7 +2070,12 @@ async function runJobItem(
   job: Job,
   item: JobItem,
   profileText: string,
-): Promise<{ status: 'done' | 'failed' | 'review'; result: string; sample?: string }> {
+): Promise<{
+  status: 'done' | 'failed' | 'review';
+  result: string;
+  sample?: string;
+  trace?: string[];
+}> {
   const tabId = job.tabId!;
   const tabState: TabState = { tabId };
 
@@ -1920,6 +2105,12 @@ async function runJobItem(
         details ? `\nWhat is known about it:\n${details}` : '',
         `\nTask for this item: ${job.task}`,
         `\nThe wider goal, for context only: ${job.goal}`,
+        // The worked example from the first completed item. Near-identical
+        // items means the path is near-identical too — following it is what
+        // lets the cheap model handle the long tail of the batch.
+        job.exemplar
+          ? `\nA previous item was completed successfully with these steps — follow the same pattern, adapting refs (take fresh snapshots) and content to THIS item:\n${job.exemplar}`
+          : '',
         ``,
         await snapshotAllFrames(tabId),
       ].join('\n'),
@@ -1940,13 +2131,27 @@ async function runJobItem(
     JOB_ITEM_SYSTEM + profileText + (sampling ? JOB_SAMPLE_RULE : job.approved ? JOB_APPROVED_RULE : '');
 
   const snapshotIds = new Set<string>();
+  const trace: string[] = [];
   let guard = 0;
   while (guard++ < job.stepsPerItem) {
-    const res = await callModel(apiKey, { model, max_tokens: 1600, system, messages, tools });
+    const res = await callModel(apiKey, {
+      model,
+      max_tokens: 1600,
+      // The exemplar-following small model works mechanically; the big model
+      // (first item, retries) keeps its default depth for drafting quality.
+      reasoning_effort: model === GROQ_MODELS.small ? 'low' : undefined,
+      system,
+      messages,
+      tools,
+    });
 
     if (res.stop_reason !== 'tool_use') {
       // Ended with prose. Treat it as the outcome rather than losing the work.
-      return { status: 'done', result: extractText(res.content as ContentBlock[]).slice(0, 300) || 'Done.' };
+      return {
+        status: 'done',
+        result: extractText(res.content as ContentBlock[]).slice(0, 300) || 'Done.',
+        trace,
+      };
     }
 
     const blocks = res.content as any[];
@@ -1960,7 +2165,7 @@ async function runJobItem(
     const finish = blocks.find((b) => b.type === 'tool_use' && b.name === 'finish_item');
     if (finish) {
       const status = finish.input?.status === 'done' ? 'done' : 'failed';
-      return { status, result: String(finish.input?.result ?? '').slice(0, 300) || 'Done.' };
+      return { status, result: String(finish.input?.result ?? '').slice(0, 300) || 'Done.', trace };
     }
 
     messages.push({ role: 'assistant', content: blocks as any });
@@ -1970,10 +2175,17 @@ async function runJobItem(
       await setStatus(`${job.done + 1}/${job.total} · ${item.label.slice(0, 28)}`);
       const r = await execTool(block.name, block.input, tabState, job.approved);
       if (SNAPSHOT_TOOLS.has(block.name)) snapshotIds.add(block.id);
+      if (!r.isError) {
+        trace.push(`${block.name}(${JSON.stringify(block.input ?? {}).slice(0, 100)})`);
+      }
       results.push({ type: 'tool_result', tool_use_id: block.id, content: r.content, is_error: r.isError });
     }
     if (!results.length) {
-      return { status: 'done', result: extractText(res.content as ContentBlock[]).slice(0, 300) || 'Done.' };
+      return {
+        status: 'done',
+        result: extractText(res.content as ContentBlock[]).slice(0, 300) || 'Done.',
+        trace,
+      };
     }
     messages.push({ role: 'user', content: results });
     pruneOldSnapshots(messages, snapshotIds);
@@ -2040,9 +2252,19 @@ async function pumpJob(): Promise<void> {
       }
 
       await ensureJobTab(job);
-      let outcome: { status: 'done' | 'failed' | 'review'; result: string; sample?: string };
+      // Exemplar economics: the big model solves the task shape once (item 1);
+      // every later first attempt runs on the cheap model with that item's
+      // step trace as a worked example. Retries escalate back to the big one.
+      const itemModel =
+        job.exemplar && item.attempts <= 1 ? GROQ_MODELS.small : setup.tier.act;
+      let outcome: {
+        status: 'done' | 'failed' | 'review';
+        result: string;
+        sample?: string;
+        trace?: string[];
+      };
       try {
-        outcome = await runJobItem(setup.apiKey, setup.tier.act, job, item, profileText);
+        outcome = await runJobItem(setup.apiKey, itemModel, job, item, profileText);
       } catch (err) {
         outcome = { status: 'failed', result: err instanceof Error ? err.message : String(err) };
       }
@@ -2058,6 +2280,11 @@ async function pumpJob(): Promise<void> {
         );
         await setStatus(null);
         return;
+      }
+
+      // First completed item: its step trace becomes the batch's exemplar.
+      if (outcome.status === 'done' && !job.exemplar && (outcome.trace?.length ?? 0) >= 2) {
+        job.exemplar = outcome.trace!.slice(0, 16).join('\n');
       }
 
       await settle(job, item, outcome.status, outcome.result);

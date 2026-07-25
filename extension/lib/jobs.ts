@@ -72,6 +72,13 @@ export interface Job {
    */
   sample?: string;
 
+  /**
+   * The step trace of the first item that completed. Later items ride on the
+   * CHEAP model with this as a worked example — the expensive model solves the
+   * task shape once, the small one repeats it. Retries escalate back up.
+   */
+  exemplar?: string;
+
   /** Steps one item is allowed before it's called a failure. */
   stepsPerItem: number;
   /** Pause between items. Deliberate: 1000 sends in an hour gets an account flagged. */
