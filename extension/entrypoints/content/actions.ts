@@ -10,6 +10,17 @@
 
 /* ── Element registry ─────────────────────────────────────────────────────── */
 
+// The counter is NEVER reset. Each snapshot clears the registry but keeps
+// counting from where the last one stopped, so a number is only ever handed out
+// once per page lifetime.
+//
+// This matters more than it looks. When the counter restarted at 0 every
+// snapshot, a ref the model was still carrying from an older tree — ref_12, say
+// — resolved against the NEW tree's ref_12, which is a different element that
+// happens to sit at the same index. The click succeeded, on the wrong thing, and
+// nothing anywhere reported a problem. Monotonic numbering turns that silent
+// misfire into an honest "stale — take a new snapshot", because the old number
+// simply isn't in the registry any more.
 let refSeq = 0;
 const registry = new Map<string, Element>();
 
@@ -251,8 +262,8 @@ function walk(node: ParentNode, depth: number, ctx: SnapCtx) {
 }
 
 function snapshot(): { tree: string; url: string; title: string; truncated: boolean } {
+  // Drop the old tree's refs but keep counting — see the note on `refSeq`.
   registry.clear();
-  refSeq = 0;
   const ctx: SnapCtx = { lines: [], truncated: false };
   if (document.body) walk(document.body, 0, ctx);
   return {
@@ -299,19 +310,57 @@ interface Fingerprint {
   url: string;
   title: string;
   labels: string[];
+  // Structural signal, for everything a label set cannot see.
+  states: string;   // checked / expanded / selected / value, per control
+  textLen: number;  // visible character count
+  count: number;    // how many interactive elements exist
+  scrollY: number;
+  focus: string;
 }
 
 // Cheap "what's on screen" signature, so an action can report what it actually
 // changed instead of just claiming success.
+//
+// Labels alone are not enough, and the gap was doing real damage. Clicking Like
+// leaves a button still labelled "Like"; ticking a checkbox, opening a menu
+// whose items are named the same, incrementing a counter — none of them move a
+// label. Every one of those came back "no visible change", which is the string
+// that triggers the background's trusted-click retry. So a click that HAD
+// worked was silently performed a second time: liked then unliked, sent twice.
+// It also fed `badStreak` and escalated the run to the expensive model for no
+// reason. Hence the state/length/count/scroll/focus bits below.
 function fingerprint(): Fingerprint {
   const labels: string[] = [];
-  for (const el of Array.from(document.querySelectorAll(INTERACTIVE)).slice(0, 400)) {
-    if (labels.length >= 120) break;
+  const states: string[] = [];
+  const all = Array.from(document.querySelectorAll(INTERACTIVE));
+  for (const el of all.slice(0, 400)) {
     if (!renderable(el)) continue;
-    const n = accName(el);
-    if (n) labels.push(n);
+    if (labels.length < 120) {
+      const n = accName(el);
+      if (n) labels.push(n);
+    }
+    if (states.length < 120) {
+      const anyEl = el as HTMLInputElement;
+      const bits = [
+        el.getAttribute('aria-checked') ?? (typeof anyEl.checked === 'boolean' ? String(anyEl.checked) : ''),
+        el.getAttribute('aria-expanded') ?? '',
+        el.getAttribute('aria-selected') ?? '',
+        typeof anyEl.value === 'string' ? String(anyEl.value.length) : '',
+      ].join('');
+      if (bits) states.push(bits);
+    }
   }
-  return { url: location.href, title: document.title, labels };
+  const active = document.activeElement;
+  return {
+    url: location.href,
+    title: document.title,
+    labels,
+    states: states.join('|'),
+    textLen: (document.body?.innerText || '').length,
+    count: all.length,
+    scrollY: Math.round(scrollY),
+    focus: active && active !== document.body ? accName(active) || active.tagName : '',
+  };
 }
 
 function describeChange(before: Fingerprint, after: Fingerprint): string {
@@ -324,6 +373,21 @@ function describeChange(before: Fingerprint, after: Fingerprint): string {
   const removed = before.labels.filter((l) => !now.has(l)).length;
   if (added.length) bits.push(`new on screen: ${added.map((a) => `"${a}"`).join(', ')}`);
   if (removed) bits.push(`${removed} element(s) disappeared`);
+
+  // Only consulted when nothing above fired: these are quieter signals, and
+  // saying "the page grew by 40 characters" over the top of "navigated to …"
+  // would bury the useful half of the report.
+  if (!bits.length) {
+    if (before.states !== after.states) bits.push('a control changed state (toggled, expanded or edited)');
+    if (before.count !== after.count) {
+      const d = after.count - before.count;
+      bits.push(`${Math.abs(d)} interactive element(s) ${d > 0 ? 'appeared' : 'went away'}`);
+    }
+    const dText = after.textLen - before.textLen;
+    if (Math.abs(dText) > 20) bits.push(`page text ${dText > 0 ? 'grew' : 'shrank'} by ${Math.abs(dText)} characters`);
+    if (before.focus !== after.focus && after.focus) bits.push(`focus moved to "${after.focus}"`);
+    if (Math.abs(after.scrollY - before.scrollY) > 40) bits.push(`the page scrolled to ${after.scrollY}px`);
+  }
   return bits.length ? bits.join('; ') : 'no visible change — the action may not have registered';
 }
 
@@ -333,11 +397,55 @@ function describeChange(before: Fingerprint, after: Fingerprint): string {
 // gesture. Fire the sequence a real mouse produces. Returns where it clicked
 // (CSS viewport coords) so the background can retry the same spot as a trusted
 // CDP click if nothing happened.
-function realClick(el: HTMLElement): { x: number; y: number } {
-  el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' as ScrollBehavior });
+/**
+ * Where on this element a real mouse could actually land.
+ *
+ * The centre is the obvious choice and usually right, but a sticky header, a
+ * cookie banner or an open modal will sit on top of it — and the click then
+ * goes to the overlay, not the button. That mattered doubly because the
+ * background's trusted-click retry re-dispatches at these exact coordinates, so
+ * a covered point got hit twice and still did nothing.
+ *
+ * Tries the centre, then points inset from each edge. Returns what is actually
+ * on top, so a blocked click can say WHAT is in the way instead of just
+ * failing — the model can then dismiss the banner and carry on.
+ */
+function hitPoint(el: HTMLElement): { x: number; y: number; blockedBy: string | null } {
   const r = el.getBoundingClientRect();
-  const clientX = r.left + r.width / 2;
-  const clientY = r.top + r.height / 2;
+  const inset = (f: number, size: number) => Math.max(2, Math.min(size * f, 12));
+  const candidates: [number, number][] = [
+    [r.left + r.width / 2, r.top + r.height / 2],
+    [r.left + inset(0.25, r.width), r.top + r.height / 2],
+    [r.right - inset(0.25, r.width), r.top + r.height / 2],
+    [r.left + r.width / 2, r.top + inset(0.25, r.height)],
+    [r.left + r.width / 2, r.bottom - inset(0.25, r.height)],
+  ];
+
+  let blocker: Element | null = null;
+  for (const [x, y] of candidates) {
+    if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) continue;
+    const top = document.elementFromPoint(x, y);
+    // The element itself, something inside it (an icon, a label span), or a
+    // shadow host that contains it — all of these deliver the click correctly.
+    if (top && (top === el || el.contains(top) || top.contains(el))) {
+      return { x: Math.round(x), y: Math.round(y), blockedBy: null };
+    }
+    if (top && !blocker) blocker = top;
+  }
+
+  const name = blocker ? accName(blocker) || blocker.tagName.toLowerCase() : 'something';
+  return {
+    x: Math.round(r.left + r.width / 2),
+    y: Math.round(r.top + r.height / 2),
+    blockedBy: name.slice(0, 60),
+  };
+}
+
+function realClick(el: HTMLElement): { x: number; y: number; blockedBy: string | null } {
+  el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' as ScrollBehavior });
+  const spot = hitPoint(el);
+  const clientX = spot.x;
+  const clientY = spot.y;
   const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX, clientY };
   const ptr = { ...base, pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0 };
 
@@ -355,7 +463,7 @@ function realClick(el: HTMLElement): { x: number; y: number } {
   el.dispatchEvent(new PointerEvent('pointerup', ptr));
   el.dispatchEvent(new MouseEvent('mouseup', { ...base, button: 0 }));
   el.dispatchEvent(new MouseEvent('click', { ...base, button: 0, detail: 1 }));
-  return { x: Math.round(clientX), y: Math.round(clientY) };
+  return { x: clientX, y: clientY, blockedBy: spot.blockedBy };
 }
 
 function setNativeValue(el: HTMLInputElement | HTMLTextAreaElement, value: string) {
@@ -422,6 +530,82 @@ function pressEnter(el: HTMLElement) {
   // would send a second time.
   if (handled) return;
   (el.closest('form') as HTMLFormElement | null)?.requestSubmit?.();
+}
+
+/** What a field actually contains now — the only honest way to know a write
+ *  landed. React and Lexical both accept a write and silently discard it often
+ *  enough that reporting "typed" without looking is a lie about half the time. */
+function readBack(el: HTMLElement): string {
+  if (el.isContentEditable || el.getAttribute('role') === 'textbox') return textOf(el);
+  return String((el as HTMLInputElement).value ?? '');
+}
+
+/** Empty a field the way a person does — select-all, then delete. Setting
+ *  value = '' skips the events rich editors need, and leaves React's tracker
+ *  believing the old text is still there. */
+function clearField(el: HTMLElement) {
+  el.focus();
+  if (el.isContentEditable || el.getAttribute('role') === 'textbox') {
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+    if (!document.execCommand('delete')) {
+      el.textContent = '';
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
+    }
+    return;
+  }
+  const field = el as HTMLInputElement;
+  setNativeValue(field, '');
+  field.dispatchEvent(new Event('input', { bubbles: true }));
+  field.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+// Menus that open on mouseover, tooltips, hover-revealed action rows. Without
+// this the tree simply never contains the thing the user is asking for, and the
+// model loops taking snapshots of a page whose menu it cannot open.
+function hoverOver(el: HTMLElement) {
+  el.scrollIntoView({ block: 'center', behavior: 'instant' as ScrollBehavior });
+  const { x: clientX, y: clientY } = hitPoint(el);
+  const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX, clientY };
+  const ptr = { ...base, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+  el.dispatchEvent(new PointerEvent('pointerover', ptr));
+  el.dispatchEvent(new MouseEvent('mouseover', base));
+  el.dispatchEvent(new PointerEvent('pointermove', ptr));
+  el.dispatchEvent(new MouseEvent('mousemove', base));
+  el.dispatchEvent(new MouseEvent('mouseenter', { ...base, bubbles: false }));
+}
+
+// Keys the agent is allowed to press. A closed list, not free text: the point
+// is to reach combobox/modal/date-picker behaviour, not to hand the model a
+// general keyboard it could type a submit into.
+const KEYS: Record<string, { key: string; code: string; keyCode: number }> = {
+  Enter: { key: 'Enter', code: 'Enter', keyCode: 13 },
+  Escape: { key: 'Escape', code: 'Escape', keyCode: 27 },
+  Tab: { key: 'Tab', code: 'Tab', keyCode: 9 },
+  Backspace: { key: 'Backspace', code: 'Backspace', keyCode: 8 },
+  Delete: { key: 'Delete', code: 'Delete', keyCode: 46 },
+  ArrowUp: { key: 'ArrowUp', code: 'ArrowUp', keyCode: 38 },
+  ArrowDown: { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40 },
+  ArrowLeft: { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 },
+  ArrowRight: { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 },
+  Home: { key: 'Home', code: 'Home', keyCode: 36 },
+  End: { key: 'End', code: 'End', keyCode: 35 },
+  PageUp: { key: 'PageUp', code: 'PageUp', keyCode: 33 },
+  PageDown: { key: 'PageDown', code: 'PageDown', keyCode: 34 },
+  Space: { key: ' ', code: 'Space', keyCode: 32 },
+};
+
+function pressKey(el: HTMLElement, name: string): boolean {
+  const k = KEYS[name];
+  if (!k) return false;
+  const init = { ...k, which: k.keyCode, bubbles: true, cancelable: true, composed: true };
+  el.dispatchEvent(new KeyboardEvent('keydown', init));
+  el.dispatchEvent(new KeyboardEvent('keypress', init));
+  el.dispatchEvent(new KeyboardEvent('keyup', init));
+  return true;
 }
 
 /* ── Label matching (fallback when a ref isn't available) ─────────────────── */
@@ -705,10 +889,19 @@ async function handle(msg: any): Promise<Reply> {
       const name = accName(el) || el.tagName.toLowerCase();
       const before = fingerprint();
       lastBefore = before;
-      const coords = realClick(el);
+      const { x, y, blockedBy } = realClick(el);
       await settle();
       const change = describeChange(before, fingerprint());
-      return { ok: true, data: `Clicked "${name}". ${change}`, coords, changed: !change.startsWith(NO_CHANGE) };
+      // Say what is covering the button. "no visible change" sends the model
+      // back to click the same thing again; "a cookie banner is on top of it"
+      // sends it to close the banner, which is the move that actually works.
+      const note = blockedBy ? ` Note: "${blockedBy}" is on top of it and may have taken the click instead.` : '';
+      return {
+        ok: true,
+        data: `Clicked "${name}". ${change}${note}`,
+        coords: { x, y },
+        changed: !change.startsWith(NO_CHANGE),
+      };
     }
 
     case 'fill': {
@@ -716,11 +909,63 @@ async function handle(msg: any): Promise<Reply> {
       if (!el) return { ok: false, error: msg.ref ? STALE(msg.ref) : 'No matching text field.' };
       const name = accName(el) || el.tagName.toLowerCase();
       const before = fingerprint();
-      writeInto(el, String(msg.text ?? ''));
+      const wanted = String(msg.text ?? '');
+      writeInto(el, wanted);
       if (msg.submit) pressEnter(el);
       await settle(msg.submit ? 2500 : 800);
-      const change = msg.submit ? ` ${describeChange(before, fingerprint())}` : '';
-      return { ok: true, data: `Typed into "${name}"${msg.submit ? ' and submitted.' : '.'}${change}` };
+
+      // Verify, rather than assume. A submitted field is usually empty again by
+      // now (that is what sending does), so read-back only judges a plain write.
+      if (!msg.submit) {
+        const got = readBack(el);
+        if (got.trim() !== wanted.trim()) {
+          return {
+            ok: false,
+            error: got
+              ? `"${name}" did not take the text — it now reads "${got.slice(0, 80)}". It may be a rich editor that needs a click first, or a field that reformats input.`
+              : `"${name}" is still empty — the text did not go in. Click the field first, then try again.`,
+          };
+        }
+        return { ok: true, data: `Typed into "${name}". Verified: it now contains the text.` };
+      }
+      return { ok: true, data: `Typed into "${name}" and submitted. ${describeChange(before, fingerprint())}` };
+    }
+
+    case 'hover': {
+      const el = get(msg.ref);
+      if (!el) return { ok: false, error: STALE(msg.ref) };
+      const name = accName(el) || el.tagName.toLowerCase();
+      const before = fingerprint();
+      hoverOver(el);
+      await settle(1200);
+      const change = describeChange(before, fingerprint());
+      return { ok: true, data: `Hovered "${name}". ${change}`, changed: !change.startsWith(NO_CHANGE) };
+    }
+
+    case 'press_key': {
+      const key = String(msg.key ?? '');
+      // No ref means "send it to the page" — Escape closing a modal, PageDown
+      // scrolling a list. The focused element is the right target for those.
+      const el = msg.ref ? get(msg.ref) : ((document.activeElement as HTMLElement) ?? document.body);
+      if (!el) return { ok: false, error: STALE(msg.ref) };
+      const before = fingerprint();
+      if (!pressKey(el, key)) {
+        return { ok: false, error: `"${key}" is not a key I can press. Try one of: ${Object.keys(KEYS).join(', ')}.` };
+      }
+      await settle(1500);
+      const change = describeChange(before, fingerprint());
+      return { ok: true, data: `Pressed ${key}. ${change}`, changed: !change.startsWith(NO_CHANGE) };
+    }
+
+    case 'clear': {
+      const el = msg.ref ? get(msg.ref) : findInput(msg.field);
+      if (!el) return { ok: false, error: msg.ref ? STALE(msg.ref) : 'No matching text field.' };
+      const name = accName(el) || el.tagName.toLowerCase();
+      clearField(el);
+      await settle(800);
+      const left = readBack(el);
+      if (left.trim()) return { ok: false, error: `"${name}" still contains "${left.slice(0, 60)}".` };
+      return { ok: true, data: `Cleared "${name}".` };
     }
 
     case 'select': {
@@ -765,22 +1010,40 @@ async function handle(msg: any): Promise<Reply> {
       const name = accName(el);
       const before = fingerprint();
       lastBefore = before;
-      const coords = realClick(el);
+      const { x, y, blockedBy } = realClick(el);
       await settle();
       const change = describeChange(before, fingerprint());
-      return { ok: true, data: `Clicked "${name.slice(0, 60)}". ${change}`, coords, changed: !change.startsWith(NO_CHANGE) };
+      const note = blockedBy ? ` Note: "${blockedBy}" is on top of it and may have taken the click instead.` : '';
+      return {
+        ok: true,
+        data: `Clicked "${name.slice(0, 60)}". ${change}${note}`,
+        coords: { x, y },
+        changed: !change.startsWith(NO_CHANGE),
+      };
     }
 
     case 'type_text': {
       const el = findInput(msg.field);
       if (!el) return { ok: false, error: 'No matching text field found on this page' };
       const before = fingerprint();
-      writeInto(el, String(msg.text ?? ''));
+      const wanted = String(msg.text ?? '');
+      writeInto(el, wanted);
       if (msg.submit) pressEnter(el);
       await settle(msg.submit ? 2500 : 800);
-      const where = accName(el) || el.tagName.toLowerCase();
-      const change = msg.submit ? ` ${describeChange(before, fingerprint())}` : '';
-      return { ok: true, data: `Typed into "${where.slice(0, 40)}"${msg.submit ? ' and submitted.' : '.'}${change}` };
+      const where = (accName(el) || el.tagName.toLowerCase()).slice(0, 40);
+      if (!msg.submit) {
+        const got = readBack(el);
+        if (got.trim() !== wanted.trim()) {
+          return {
+            ok: false,
+            error: got
+              ? `"${where}" did not take the text — it now reads "${got.slice(0, 80)}".`
+              : `"${where}" is still empty — the text did not go in.`,
+          };
+        }
+        return { ok: true, data: `Typed into "${where}". Verified: it now contains the text.` };
+      }
+      return { ok: true, data: `Typed into "${where}" and submitted. ${describeChange(before, fingerprint())}` };
     }
 
     case 'attach_file': {

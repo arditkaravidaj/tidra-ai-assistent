@@ -223,6 +223,49 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: 'hover',
+    description:
+      'Move the mouse onto an element without clicking. Use when a menu, submenu or row of actions only appears on hover — snapshot afterwards to get refs for whatever it revealed.',
+    input_schema: {
+      type: 'object',
+      properties: { ref: { type: 'string', description: 'A ref from the latest snapshot' } },
+      required: ['ref'],
+    },
+  },
+  {
+    name: 'press_key',
+    description:
+      'Press one key. Escape closes a dialog or dropdown, ArrowDown/Enter picks an item in an autocomplete or combobox, Tab moves to the next field. Omit "ref" to send it to whatever has focus. Enter here can submit — in a message or post composer, draft it and use confirm_action instead.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        key: {
+          type: 'string',
+          enum: [
+            'Enter', 'Escape', 'Tab', 'Backspace', 'Delete',
+            'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+            'Home', 'End', 'PageUp', 'PageDown', 'Space',
+          ],
+          description: 'Which key to press',
+        },
+        ref: { type: 'string', description: 'Send the key to this element (optional — defaults to whatever is focused)' },
+      },
+      required: ['key'],
+    },
+  },
+  {
+    name: 'clear',
+    description:
+      'Empty a text field. fill() already replaces what is there, so use this only when you need a field left blank, or when a fill did not take and you want a clean start.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        ref: { type: 'string', description: 'A ref from the latest snapshot' },
+        field: { type: 'string', description: 'Label hint instead of a ref (e.g. "search")' },
+      },
+    },
+  },
+  {
     name: 'scroll',
     description:
       'Scroll the page, or bring one element into view. Use this when a snapshot says elements are offscreen, or when a list loads more as you scroll.',
@@ -551,10 +594,32 @@ function extractText(content: ContentBlock[]): string {
 interface ChatMsg {
   role: 'user' | 'assistant' | 'error';
   text: string;
+  /**
+   * What the agent actually DID on this turn — the tool calls, abbreviated.
+   *
+   * Without this a turn leaves behind one sentence ("Done — I replied.") and
+   * everything else evaporates when `runAgent` returns: which post, which
+   * button, and above all the text that was drafted. The next turn then met
+   * "make it shorter" with nothing to shorten, and the user quite reasonably
+   * concluded Tidra had forgotten the conversation. It had.
+   */
+  trace?: string[];
+  /** Where the user was standing when they said this. One line, so a later
+   *  "that page" still resolves after the full page text has been dropped. */
+  page?: { title: string; url: string };
 }
 interface ChatState {
   messages: ChatMsg[];
   loading: boolean;
+  /**
+   * Turns older than the window we still send verbatim, folded into prose.
+   * `covers` is how many messages are already in it, so each overflow extends
+   * the summary instead of re-reading (and re-paying for) the whole thread.
+   */
+  summary?: { text: string; covers: number };
+  /** The route the last turn took, for follow-ups that carry no route of their
+   *  own. See `inheritRoute`. */
+  route?: 'chat' | 'look' | 'act';
 }
 
 // ─── Routine learning ──────────────────────────────────────────────────────
@@ -822,6 +887,12 @@ function statusFor(tool: string, input: any): string {
       return 'Choosing an option';
     case 'scroll':
       return 'Scrolling';
+    case 'hover':
+      return 'Opening the menu';
+    case 'press_key':
+      return `Pressing ${String(input?.key ?? 'a key')}`;
+    case 'clear':
+      return 'Clearing the field';
     case 'screenshot':
       return 'Taking a look';
     case 'open_url': {
@@ -856,13 +927,112 @@ function statusFor(tool: string, input: any): string {
   }
 }
 
-async function pushChat(text: string, role: 'assistant' | 'error') {
+async function pushChat(
+  text: string,
+  role: 'assistant' | 'error',
+  // What this turn did, and which route it took. Both are read back on the NEXT
+  // turn — the trace so a follow-up knows what "it" refers to, the route so a
+  // follow-up doesn't get re-classified onto a different one. See ChatMsg.
+  meta?: { trace?: string[]; route?: 'chat' | 'look' | 'act' },
+) {
   const { tidraChat } = await browser.storage.local.get('tidraChat');
   const chat = (tidraChat as ChatState) || { messages: [], loading: false };
-  chat.messages.push({ role, text });
+  const msg: ChatMsg = { role, text };
+  if (meta?.trace?.length) msg.trace = meta.trace.slice(-TRACE_KEEP);
+  chat.messages.push(msg);
   chat.loading = false;
+  if (meta?.route) chat.route = meta.route;
   // Mark unread so the collapsed island can surface the new result.
   await browser.storage.local.set({ tidraChat: chat, tidraUnread: true, tidraStatus: null });
+}
+
+// ─── Cross-turn memory ──────────────────────────────────────────────────────
+// Within a run, `compactMessages` keeps the transcript small. Between runs there
+// was nothing at all: every turn re-read the entire chat from storage, forever,
+// and the model saw only the final sentence of each past turn. These three
+// constants and the two helpers below are the between-turns half.
+
+/** Recent messages sent verbatim. Everything older lives in the summary. */
+const HISTORY_WINDOW = 12;
+/** Tool calls kept per turn. Enough to reconstruct what happened, not a log. */
+const TRACE_KEEP = 12;
+
+const THREAD_SUMMARY_SYSTEM = `You maintain a running summary of a conversation between a user and their browser assistant. Given the summary so far and the turns that have since scrolled out of view, return ONE updated paragraph. Keep: what the user asked for, decisions they made, anything drafted or sent (quote short drafts), names, URLs and numbers that were established. Drop pleasantries. No preamble.`;
+
+/**
+ * Fold anything past the window into `chat.summary`, in place.
+ *
+ * Only the newly-overflowed messages are sent — the previous summary rides
+ * along as context — so a long thread costs one small call per overflow rather
+ * than re-summarising itself from the top every turn.
+ */
+async function summariseOverflow(apiKey: string, chat: ChatState, signal?: AbortSignal): Promise<void> {
+  const covered = chat.summary?.covers ?? 0;
+  const overflowEnd = chat.messages.length - HISTORY_WINDOW;
+  if (overflowEnd <= covered) return;
+
+  const chunk = chat.messages
+    .slice(covered, overflowEnd)
+    .filter((m) => m.role !== 'error')
+    .map((m) => {
+      const did = m.trace?.length ? `\n  (did: ${m.trace.join('; ').slice(0, 400)})` : '';
+      return `${m.role === 'user' ? 'User' : 'Tidra'}: ${m.text.slice(0, 500)}${did}`;
+    })
+    .join('\n');
+  if (!chunk.trim()) {
+    chat.summary = { text: chat.summary?.text ?? '', covers: overflowEnd };
+    return;
+  }
+
+  try {
+    const res = await callModel(
+      apiKey,
+      {
+        model: GROQ_MODELS.small,
+        max_tokens: 400,
+        reasoning_effort: 'low',
+        system: THREAD_SUMMARY_SYSTEM,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              chat.summary?.text ? `Summary so far:\n${chat.summary.text}` : 'No summary yet.',
+              ``,
+              `New turns that scrolled out of view:`,
+              chunk,
+            ].join('\n').slice(0, 16000),
+          },
+        ],
+      },
+      signal,
+    );
+    const text = extractText(res.content).trim();
+    if (text) chat.summary = { text, covers: overflowEnd };
+  } catch {
+    // If this fails the window still applies — the thread loses its distant
+    // past, which is worse than having it and better than sinking the turn.
+  }
+}
+
+// A follow-up carries no route of its own. "make it shorter" re-classified from
+// scratch could come back `look`, which moves the run to a hidden tab AND strips
+// the current page out of the prompt — the agent then wakes up somewhere else
+// with no idea what it was doing. Indistinguishable, from the outside, from
+// having forgotten the conversation.
+const FOLLOW_UP = /\b(it|that|this|them|those|these|again|instead|shorter|longer|same|one)\b/i;
+const CONNECTIVE = /^\s*(no|nope|yes|yeah|yep|ok|okay|sure|and|but|also|then|now|actually|wait|please)\b/i;
+// …but a follow-up that names a browser action is a genuinely new request and
+// must be routed on its merits: "now reply to it" after a chat answer needs the
+// act route, whatever the turn before it was.
+const ACTION_VERB =
+  /\b(reply|respond|send|post|comment|click|open|fill|submit|buy|order|download|attach|upload|search|log ?in|sign ?in|share|follow|connect|delete|book|check|find)\b/i;
+
+function inheritRoute(text: string, last?: 'chat' | 'look' | 'act'): 'chat' | 'look' | 'act' | null {
+  if (!last) return null;
+  const t = text.trim();
+  if (!t || t.length > 80) return null;
+  if (ACTION_VERB.test(t)) return null;
+  return FOLLOW_UP.test(t) || CONNECTIVE.test(t) ? last : null;
 }
 
 // Cheap router: chat (no browser) / look (browser, read-only → runs hidden) /
@@ -1251,6 +1421,16 @@ async function execTool(
     return {
       content:
         'Refused: submit=true would send/post this, which is irreversible. Call confirm_action first and wait for the user. If they confirm, you may submit.',
+      isError: true,
+    };
+  }
+  // press_key was very nearly a hole straight through the gate above: Enter in a
+  // composer sends, and a key press is not a fill. The gate is about the effect,
+  // not the tool that produced it, so Enter goes through the same door.
+  if (name === 'press_key' && input?.key === 'Enter' && !allowSubmit) {
+    return {
+      content:
+        'Refused: pressing Enter here could send or submit, which is irreversible. Call confirm_action first and wait for the user. Escape, Tab and the arrow keys are always available if you just need to navigate a menu.',
       isError: true,
     };
   }
@@ -1759,7 +1939,10 @@ async function execTool(
     }
 
     // Ref-based actions — the primary path.
-    if (name === 'click' || name === 'fill' || name === 'select' || name === 'scroll') {
+    if (
+      name === 'click' || name === 'fill' || name === 'select' || name === 'scroll' ||
+      name === 'hover' || name === 'press_key' || name === 'clear'
+    ) {
       const { frameId, local } = parseRef(input.ref ?? '');
       const res = await sendAction(
         tabState.tabId,
@@ -1769,6 +1952,8 @@ async function execTool(
           ref: input.ref ? local : undefined,
           text: input.text,
           option: input.option,
+          field: input.field,
+          key: input.key,
           submit: !!input.submit,
           direction: input.direction,
           amount: input.amount,
@@ -1776,6 +1961,23 @@ async function execTool(
         10,
         input.ref ? frameId : 0,
       );
+
+      // A click that starts a page load returns from the OLD document — settle()
+      // caps at 2.5s and the content script answering is the one about to be
+      // torn down. So the agent read a page that no longer existed, then acted
+      // on refs from it. If the tab went into `loading`, wait it out and say so.
+      if ((name === 'click' || name === 'press_key') && res?.ok) {
+        const tab = await browser.tabs.get(tabState.tabId).catch(() => null);
+        if (tab?.status === 'loading') {
+          await waitForTabLoad(tabState.tabId, 15000);
+          const now = await browser.tabs.get(tabState.tabId).catch(() => null);
+          return {
+            content: `${res.data} The page then loaded: now on "${now?.title ?? ''}" (${now?.url ?? ''}). Take a fresh snapshot — every earlier ref is gone.`,
+            isError: false,
+          };
+        }
+      }
+
       // Synthetic events are isTrusted:false and some apps ignore them cold.
       // A click that visibly did nothing gets one retry as a trusted CDP click
       // at the same spot — indistinguishable from a real mouse. Top frame only:
@@ -1825,9 +2027,40 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   // Build conversation memory from persisted chat so multi-turn flows work
   // (e.g. Tidra drafts an email, user later says "yes, send it").
   const { tidraChat } = await browser.storage.local.get('tidraChat');
-  const history = ((tidraChat as ChatState | undefined)?.messages ?? []).filter(
-    (m) => m.role !== 'error',
-  );
+  const chatState = (tidraChat as ChatState | undefined) ?? { messages: [], loading: false };
+  const stored = chatState.messages ?? [];
+
+  // Fold anything past the window into the rolling summary, then work from the
+  // window alone. Before this, every turn re-sent the entire chat from the very
+  // first message — a forty-turn thread paid for forty turns, every time, and
+  // the router's view of it got worse the longer you talked.
+  await summariseOverflow(apiKey, chatState);
+
+  // Note where the user was when they asked. The full page text only ever rides
+  // on the newest turn (that is what keeps the prompt prefix cacheable), so
+  // without this breadcrumb a page referred to two turns later has left no
+  // trace at all — not even its URL.
+  const incoming = stored[stored.length - 1];
+  const stampPage =
+    incoming?.role === 'user' && !incoming.page && /^https?:/i.test(message.page.url ?? '');
+  if (stampPage) {
+    incoming.page = { title: (message.page.title ?? '').slice(0, 120), url: message.page.url };
+  }
+  if (chatState.summary || stampPage) {
+    // Merge rather than overwrite: summarising is a network round-trip, and the
+    // only parts of the chat this owns are the summary and that breadcrumb.
+    const { tidraChat: fresh } = await browser.storage.local.get('tidraChat');
+    const base = (fresh as ChatState) ?? chatState;
+    const msgs = base.messages ?? [];
+    if (stampPage && msgs.length && msgs[msgs.length - 1].role === 'user') {
+      msgs[msgs.length - 1].page = incoming.page;
+    }
+    await browser.storage.local.set({
+      tidraChat: { ...base, messages: msgs, summary: chatState.summary ?? base.summary },
+    });
+  }
+  const threadSummary = stored.length > HISTORY_WINDOW ? chatState.summary?.text ?? null : null;
+  const history = stored.slice(-HISTORY_WINDOW).filter((m) => m.role !== 'error');
 
   // Slash skills: "/fact-check the stats" expands into the saved prompt before
   // the model sees it. The chat keeps showing what the user typed; only the
@@ -1846,6 +2079,13 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   }
 
   const messages: Message[] = [];
+  if (threadSummary) {
+    messages.push({
+      role: 'user',
+      content: `[Earlier in this conversation: ${threadSummary}]`,
+    });
+    messages.push({ role: 'assistant', content: 'Understood — I have the earlier context.' });
+  }
   history.forEach((m, i) => {
     const isLastUser = i === history.length - 1 && m.role === 'user';
     if (isLastUser) {
@@ -1863,12 +2103,25 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
           `User request: ${expandedPrompt ?? m.text}`,
         ].join('\n'),
       });
+    } else if (m.role === 'assistant' && m.trace?.length) {
+      // The turn's own record of what it did, replayed. This is what lets "make
+      // it shorter" find the draft, and "no, the other one" find the button.
+      // Written once and never rewritten, so it does not disturb Groq's prefix
+      // cache the way a sliding recap would.
+      messages.push({
+        role: 'assistant',
+        content: `${m.text}\n\n[What I did that turn: ${m.trace.join('; ')}]`,
+      });
+    } else if (m.role === 'user' && m.page?.url) {
+      // One line, not the page text: enough that "that page" still resolves
+      // three turns later, cheap enough to keep for every turn in the window.
+      messages.push({ role: 'user', content: `${m.text}\n(asked on: ${m.page.title} — ${m.page.url})` });
     } else {
       messages.push({ role: m.role as 'user' | 'assistant', content: m.text });
     }
   });
   // Safety net: if history was empty for some reason, use the incoming prompt.
-  if (messages.length === 0) {
+  if (!history.length) {
     messages.push({ role: 'user', content: expandedPrompt ?? message.prompt });
   }
 
@@ -1926,9 +2179,20 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
     return;
   }
 
-  // Decide route: explicit hint (quick actions, a skill's mode) or the cheap router.
+  // Decide route: explicit hint (quick actions, a skill's mode), then an
+  // inherited one for a bare follow-up, then the cheap router.
+  //
+  // The inherit step is not an optimisation. Re-classifying "make it shorter" on
+  // its own could land on `look`, and a look runs on a hidden tab with the
+  // current page stripped out of the prompt — so a follow-up to an act-run would
+  // occasionally wake up somewhere else entirely, with no page and no idea what
+  // it had been doing. That reads as amnesia, and it was.
+  const inherited = intent ? null : inheritRoute(lastUserText, chatState.route);
+  if (inherited) stepLog.push(`Continuing where we left off (${inherited})`);
   const route: 'chat' | 'look' | 'act' =
-    intent ?? (await classify(apiKey, tier.router, expandedPrompt ?? message.prompt, history, abort.signal));
+    intent ??
+    inherited ??
+    (await classify(apiKey, tier.router, expandedPrompt ?? message.prompt, history, abort.signal));
   // Both browser routes drive the same agent loop with the same tools. What
   // separates them is WHERE: a look works in Tidra's hidden tab and comes back
   // with an answer, an act works where the user can watch it.
@@ -1956,8 +2220,29 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
 
   // Attachments ride on the newest user turn. Text files are inlined; images
   // become image blocks, which only the vision model can actually read.
-  const attachments = message.attachments ?? [];
+  let attachments = message.attachments ?? [];
+
+  // An image was visible for exactly one turn. The chat bubble keeps a 96px
+  // thumbnail, but the model got nothing at all on turn two — so "what's in this
+  // screenshot?" → "now write a caption for it" answered about nothing. Carry
+  // the last turn's images forward when the follow-up plainly refers back and
+  // brings no images of its own.
+  if (!attachments.length && inheritRoute(lastUserText, chatState.route)) {
+    const { tidraLastImages } = await browser.storage.local.get('tidraLastImages');
+    const carried = tidraLastImages as { images?: Attachment[]; ts?: number } | undefined;
+    // Half an hour: long enough for a real back-and-forth, short enough that a
+    // picture from this morning never silently joins tonight's question.
+    if (carried?.images?.length && Date.now() - (carried.ts ?? 0) < 30 * 60 * 1000) {
+      attachments = carried.images;
+      stepLog.push('Still looking at the image from before');
+    }
+  }
+
   const images = attachments.filter((a) => a.kind === 'image');
+  // Keep at most two, and only the ones actually used this turn.
+  await browser.storage.local.set(
+    images.length ? { tidraLastImages: { images: images.slice(0, 2), ts: Date.now() } } : {},
+  );
   if (attachments.length) {
     const last = messages[messages.length - 1];
     const parts: ContentBlock[] = [];
@@ -2092,7 +2377,7 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
       continue;
     }
     if (response.stop_reason !== 'tool_use') {
-      await pushChat(extractText(response.content as ContentBlock[]), 'assistant');
+      await pushChat(extractText(response.content as ContentBlock[]), 'assistant', { trace, route });
       // Remember where the background check ended up, so a follow-up ("reply to
       // the first one") can be picked up on that very page.
       if (route === 'look') await saveBgContext(tabState.tabId);
@@ -2126,7 +2411,7 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
           });
           continue;
         }
-        await pushChat(printed.summary, 'assistant');
+        await pushChat(printed.summary, 'assistant', { trace, route });
         await browser.storage.local.set({ tidraPending: { label: printed.label } });
         return;
       }
@@ -2135,7 +2420,7 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
     if (confirmBlock && !autoMode) {
       const pre = extractText(response.content as ContentBlock[]);
       const summary = confirmBlock.input?.summary || 'Ready. Do you want me to proceed?';
-      await pushChat([pre, summary].filter(Boolean).join('\n\n'), 'assistant');
+      await pushChat([pre, summary].filter(Boolean).join('\n\n'), 'assistant', { trace, route });
       await browser.storage.local.set({
         tidraPending: { label: confirmBlock.input?.confirm_label || 'Send' },
       });
@@ -2183,8 +2468,12 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
       if (block.name === 'focus_background' && bgCtx) {
         actDomain = domainOf(bgCtx.url) ?? actDomain;
       }
+      // Anything that WROTE text gets a longer leash. This trace is what the
+      // next turn reads back, and a draft cut off at 100 characters is no use
+      // to "make it shorter" — the draft IS the thing being referred to.
+      const wrote = block.name === 'fill' || block.name === 'type_text' || block.name === 'create_report';
       trace.push(
-        `${block.name}(${JSON.stringify(block.input ?? {}).slice(0, 100)}) ${
+        `${block.name}(${JSON.stringify(block.input ?? {}).slice(0, wrote ? 600 : 100)}) ${
           result.isError ? `✗ ${resultText(result.content as any).slice(0, 60)}` : '→ ok'
         }`,
       );
@@ -2196,7 +2485,7 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
       });
     }
     if (toolResults.length === 0) {
-      await pushChat(extractText(response.content as ContentBlock[]), 'assistant');
+      await pushChat(extractText(response.content as ContentBlock[]), 'assistant', { trace, route });
       return;
     }
     messages.push({ role: 'user', content: toolResults });
@@ -2237,6 +2526,7 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   await pushChat(
     "I ran out of steps before finishing. Tell me what's left and I'll carry on, or break it into smaller pieces.",
     'assistant',
+    { trace, route },
   );
   } catch (err) {
     if (abort.signal.aborted) {

@@ -1,6 +1,18 @@
-# Tidra
+<p align="center">
+  <img src="assets/tidra-logo.svg" alt="Tidra" width="440">
+</p>
 
-**An AI assistant that lives in your browser.**
+<h3 align="center">An AI assistant that lives in your browser.</h3>
+
+<p align="center">
+  <img alt="Chrome MV3" src="https://img.shields.io/badge/Chrome-MV3-0a0a0a?style=flat-square&logo=googlechrome&logoColor=white">
+  <img alt="WXT" src="https://img.shields.io/badge/built%20with-WXT-4c1?style=flat-square">
+  <img alt="React + TypeScript" src="https://img.shields.io/badge/React-TypeScript-3178c6?style=flat-square&logo=typescript&logoColor=white">
+  <img alt="Groq" src="https://img.shields.io/badge/inference-Groq-f55036?style=flat-square">
+  <img alt="No server, no telemetry" src="https://img.shields.io/badge/data-100%25%20local-0a0a0a?style=flat-square">
+</p>
+
+---
 
 A floating "island" sits on every page. Ask it about what you're reading, or tell it to do
 something — open a site, fill a form, draft a reply, save a PDF, work through a list of 200
@@ -104,6 +116,7 @@ The full, exhaustive list — every button, every behavior, every limit — is i
 tidra-ai-assistent/
 ├── README.md                  ← you are here
 ├── CHANGELOG.md
+├── assets/                    ← brand mark + logo lockup (used by this README)
 ├── docs/                      ← all documentation
 └── extension/                 ← the browser extension (WXT + React + TypeScript)
     ├── wxt.config.ts          manifest, permissions, keyboard command
