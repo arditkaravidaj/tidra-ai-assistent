@@ -366,6 +366,12 @@ export async function readFile(rec: FolderRecord, path: string): Promise<FileByt
   return { name: file.name, mime: file.type || mimeOf(path), size: file.size, base64: bytesToBase64(bytes) };
 }
 
+/** Raw bytes of one file — for callers that parse the format themselves (PDFs). */
+export async function readBytes(rec: FolderRecord, path: string): Promise<Uint8Array> {
+  const file = await (await resolveFile(rec, path)).getFile();
+  return new Uint8Array(await file.arrayBuffer());
+}
+
 /**
  * A text file's contents, truncated. This one DOES enter the conversation, so
  * it is capped in characters rather than bytes and says when it cut — a model

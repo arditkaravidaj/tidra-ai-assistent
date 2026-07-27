@@ -689,7 +689,10 @@ async function handle(msg: any): Promise<Reply> {
         data: {
           title: document.title,
           url: location.href,
-          text: (document.body?.innerText || '').replace(/\n{3,}/g, '\n\n').slice(0, 12000),
+          // Matches the cap on the page text the island sends with a request:
+          // get_page is how the agent goes back for the real thing, so it must
+          // never hand back less than the prompt already had.
+          text: (document.body?.innerText || '').replace(/\n{3,}/g, '\n\n').slice(0, 16000),
         },
       };
 

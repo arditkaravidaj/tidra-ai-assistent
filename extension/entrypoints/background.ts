@@ -39,6 +39,7 @@ import { reportUrl, saveReport } from '../lib/library';
 import { base64ToBlob, transcribe } from '../lib/voice';
 import { buildPdf, bytesToBase64, safeFilename, toWinAnsiText } from '../lib/pdf';
 import { extFromUrl, nameFromUrl, saveData, saveUrl } from '../lib/download';
+import { extractPdfText } from '../lib/pdftext';
 import {
   findFolder,
   folderAccess,
@@ -47,6 +48,7 @@ import {
   listTree,
   markUsed,
   nextUnused,
+  readBytes,
   readFile,
   readText,
   statFile,
@@ -403,7 +405,7 @@ const TOOLS: Tool[] = [
   {
     name: 'read_folder_file',
     description:
-      "Read ONE text file out of a connected folder — a caption, a script, a CSV, some notes. Only call this for the specific file you need: the contents come back into the conversation, so reading a folder file-by-file is wasteful and usually unnecessary. Pictures, videos and PDFs cannot be read this way; to put a picture on a page, use attach_file instead.",
+      "Read ONE file out of a connected folder and get its text back — a PDF (letters, statements, invoices), a caption, a script, a CSV, some notes. Call it once per file you actually need: the contents come into the conversation, so working through a whole folder this way is expensive. If the user asks what several documents say, read them one at a time and summarise as you go. A scanned PDF has no text in it, only a picture of one, and will say so. Pictures and videos cannot be read — to put one on a page, use attach_file.",
     input_schema: {
       type: 'object',
       properties: {
@@ -1116,6 +1118,52 @@ async function ensureAgentTab(): Promise<number | undefined> {
   return tab.id;
 }
 
+const hostOf = (url: string): string | null => {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Is this URL just "the site", with no particular page in mind?
+ * "https://mail.google.com" is; ".../mail/u/0/#inbox" is not. The difference
+ * decides whether an already-open tab gets navigated or simply used where it
+ * stands.
+ */
+function isBareHost(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return (u.pathname === '/' || u.pathname === '') && !u.search && !u.hash;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A tab the user already has open on this site, most recently used first.
+ *
+ * Opening a second Gmail when one is sitting right there is both untidy and
+ * wrong: the open one is signed in, scrolled, and already where the user was
+ * working. Tabs pile up one per request until the window is unusable.
+ */
+async function findOpenTab(url: string): Promise<{ id: number; url: string } | null> {
+  const host = hostOf(url);
+  if (!host) return null;
+  const tabs = await browser.tabs.query({}).catch(() => []);
+  const matches = tabs.filter((t) => t.id != null && t.url && hostOf(t.url) === host);
+  if (!matches.length) return null;
+  // Most recently touched: with two Gmail tabs open, the live one is the one
+  // the user was last in, not whichever Chrome happens to list first.
+  matches.sort(
+    (a, b) =>
+      ((b as { lastAccessed?: number }).lastAccessed ?? 0) - ((a as { lastAccessed?: number }).lastAccessed ?? 0),
+  );
+  const best = matches[0];
+  return { id: best.id as number, url: best.url as string };
+}
+
 /**
  * Where a background "look" left off. A check ("any new mail?") reads a site
  * without the user watching; the follow-up ("reply to the first one") is about
@@ -1382,15 +1430,35 @@ async function execTool(
       if ('error' in found) return { content: found.error, isError: true };
       const path = String(input?.file ?? '').trim();
       if (!path) return { content: 'Pass the file to read as `file`.', isError: true };
-      if (!isText(path)) {
-        // Being specific about PDFs matters — "not a text file" reads like a
-        // quibble about the extension, and the user tries again with the same
-        // file. Tidra can hand a PDF to a page; it cannot read one.
-        const pdf = /\.pdf$/i.test(path);
+      // PDFs carry instructions for painting glyphs, not text, so they get a
+      // parser rather than a read. A scan has no text in it at all — that comes
+      // back as a `note`, and it must reach the user as "this is a picture of a
+      // document", never as an empty file.
+      if (/\.pdf$/i.test(path)) {
+        const bytes = await readBytes(found.rec, path).catch(() => null);
+        if (!bytes) {
+          return {
+            content: `There is no file called "${path}" in "${found.rec.label}" — call list_folder_files to see what is there.`,
+            isError: true,
+          };
+        }
+        const doc = await extractPdfText(bytes).catch(() => null);
+        if (!doc || !doc.text) {
+          return { content: doc?.note ?? `Could not read "${path}".`, isError: true };
+        }
+        const MAX = 20000;
+        const cut = doc.text.length > MAX;
         return {
-          content: pdf
-            ? `Tidra cannot read the text inside a PDF — it can only create PDFs, not open them. It CAN upload "${path}" to a page with attach_file. Tell the user plainly that reading the contents of their PDFs is not something Tidra can do yet.`
-            : `"${path}" is not a text file, so its contents would be meaningless as text. To put it on a page, use attach_file.`,
+          content:
+            `${path} — ${doc.pages} page${doc.pages === 1 ? '' : 's'}${cut ? ', first part only (the document is longer and was cut off)' : ''}:\n\n` +
+            doc.text.slice(0, MAX),
+          isError: false,
+        };
+      }
+
+      if (!isText(path)) {
+        return {
+          content: `"${path}" is not a text file, so its contents would be meaningless as text. To put it on a page, use attach_file.`,
           isError: true,
         };
       }
@@ -1438,7 +1506,26 @@ async function execTool(
     if (name === 'open_url') {
       let url: string = String(input.url || '');
       if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
-      if (input.new_tab) {
+
+      // Already open? Work in THAT tab. It is signed in, it is where the user
+      // left off, and it is the one they meant. Only an explicit new_tab
+      // request overrides this — otherwise every "check my mail" leaves another
+      // Gmail behind until the window is a row of duplicates.
+      const existing = input.new_tab ? null : await findOpenTab(url);
+      if (existing) {
+        tabState.tabId = existing.id;
+        // Asked for the site in general and the tab is already on it: leave it
+        // exactly where it is rather than reloading over the user's place.
+        if (isBareHost(url)) {
+          await sleep(200);
+          const tree = await snapshotAllFrames(existing.id);
+          return {
+            content: `Using the ${hostOf(url)} tab the user already had open — it is on ${existing.url}. If you need a different page there, call open_url with the full URL.\n\n${tree}`,
+            isError: false,
+          };
+        }
+        if (existing.url !== url) await browser.tabs.update(existing.id, { url });
+      } else if (input.new_tab) {
         // active:false — opening a tab must not yank the user away from
         // whatever they are doing. They can click over to watch if they want.
         const tab = await browser.tabs.create({ url, active: false });
@@ -1451,7 +1538,8 @@ async function execTool(
       await waitForTabLoad(tabState.tabId);
       await sleep(400);
       const tree = await snapshotAllFrames(tabState.tabId);
-      return { content: `Opened ${url}${input.new_tab ? ' (new tab)' : ''}\n\n${tree}`, isError: false };
+      const how = existing ? ' (in the tab that was already open)' : input.new_tab ? ' (new tab)' : '';
+      return { content: `Opened ${url}${how}\n\n${tree}`, isError: false };
     }
 
     if (tabState.tabId == null) return { content: 'No working tab.', isError: true };
@@ -1525,7 +1613,20 @@ async function execTool(
     if (name === 'get_page') {
       const res = await sendAction(tabState.tabId, { type: 'tidra-action', action: 'get_page' });
       const page = res?.data as PageContext;
-      return { content: `Title: ${page?.title}\nURL: ${page?.url}\n\n${(page?.text || '').slice(0, 6000)}`, isError: false };
+      // The opening prompt already carries 15k of this page. Cutting the tool
+      // that exists to "read it properly" down to 6k meant every deliberate
+      // re-read came back with LESS than the model started with — so a long
+      // inbox or thread looked like it simply ended, and whatever was asked
+      // about got reported as not there.
+      const text = page?.text || '';
+      const MAX = 15000;
+      const cut = text.length > MAX;
+      return {
+        content:
+          `Title: ${page?.title}\nURL: ${page?.url}\n\n${text.slice(0, MAX)}` +
+          (cut ? '\n\n[The page is longer than this — scroll() and call get_page again for the rest.]' : ''),
+        isError: false,
+      };
     }
     if (name === 'list_images') {
       const res = await sendAction(tabState.tabId, { type: 'tidra-action', action: 'list_images' });
@@ -1818,6 +1919,7 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
       tier,
       { ...message, prompt: expandedPrompt ?? threadPrompt },
       abort.signal,
+      workingTabId,
     ))
   ) {
     await clearLoading();
@@ -1896,7 +1998,12 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
   // able to lose the document.
   screenshotDirect = supportsVision(actModel);
   const tools: any[] = !browsing
-    ? TOOLS.filter((t) => t.name === 'create_pdf' || t.name === 'create_report')
+    ? // get_page comes too: the chat route is given ONE truncated blob of the
+      // page and, without this, no way to ever see more of it. A long thread or
+      // inbox simply appeared to stop, and "summarise this" answered from the
+      // first screenful as though that were the whole thing. Reading is not
+      // browsing — it changes nothing and needs no tab of its own.
+      TOOLS.filter((t) => ['create_pdf', 'create_report', 'get_page'].includes(t.name))
     : TOOLS.filter((t) => {
         // An unfocused tab cannot be captured, so a look gets no eyes — and it
         // confirms nothing, because it sends nothing.
@@ -2321,12 +2428,17 @@ async function runRoutine() {
       }
 
       try {
-        const tab = await browser.tabs.create({ url: site.url, active: false });
+        // Reuse the site's existing tab. A routine runs every day over the same
+        // handful of sites; creating a tab per site per run is how a window ends
+        // up with four LinkedIns. The tab is left where the user had it —
+        // the routine reads the site, it does not need a pristine landing page.
+        const open = await findOpenTab(site.url);
+        const tab = open ? { id: open.id } : await browser.tabs.create({ url: site.url, active: false });
         if (tab.id == null) {
           await pushChat(`**${name}** — couldn't open the tab.`, 'error');
           continue;
         }
-        await waitForTabLoad(tab.id);
+        if (!open) await waitForTabLoad(tab.id);
         await sleep(700);
         const report = await runSiteAgent(apiKey, tier.act, task, tab.id, profileText);
         sections.push(`## ${name}\n\n${report}`);
@@ -2379,13 +2491,40 @@ const JOB_ALARM = 'tidra-job-tick';
 /** A pump that hasn't touched its job in this long is presumed dead. */
 const BEAT_STALE_MS = 90_000;
 
-/** Cheap prefilter, so an ordinary message never pays for a planner call. */
+/** Doing something TO each target — the thing that makes a batch a batch. */
+const BATCH_ACTION =
+  /\b(send|sending|message|messaging|dm|email|emailing|mail|write|writing|draft|drafting|reply|replying|respond|responding|answer|post|posting|comment|like|follow|unfollow|connect|invite|apply|submit|fill|register|subscribe|unsubscribe|delete|archive|remove|upload|download|export|rename)\b/;
+
+/** Explicitly one-target-at-a-time, whatever the verb: a batch by construction. */
+const BATCH_SWEEP =
+  /\b(?:one by one|for each|each of (?:these|those|them)|(?:go through|search|check|visit|open|scan|read|look through)\s+(?:all|every|each))\b/;
+
+/** A question about what is already there. Its ANSWER is a list; its work is not. */
+const READ_ASK =
+  /\b(list|show|tell me|give me|summari[sz]e|how many|how much|which|what|who|where|when|is there|are there|do i have|did i|any new)\b/;
+
+/**
+ * Cheap prefilter, so an ordinary message never pays for a planner call.
+ *
+ * Plurality alone is NOT a batch. "List all my unanswered emails" is one look
+ * at one page whose answer happens to be a list; "reply to all my unanswered
+ * emails" is a hundred separate visits. What separates them is whether
+ * something is DONE to each target, so an action verb is required — not just
+ * "all" or a count. Getting this wrong is expensive in exactly the way a user
+ * notices: the job path takes the request over, cannot build a list, and asks
+ * for a CSV of things that were on the screen the whole time.
+ */
 function looksBatch(prompt: string): boolean {
-  const p = prompt.toLowerCase();
-  if (/^confirmed\s+—/.test(p.trim())) return false;
-  if (/\b(all|each|every|everyone|everybody|bulk|mass)\b/.test(p)) return true;
-  // A standalone count of 3 or more: "send 10 …", "write 1000 emails".
-  return /\b([3-9]|\d{2,})\b/.test(p);
+  const p = prompt.toLowerCase().trim();
+  if (/^confirmed\s+—/.test(p)) return false;
+  if (BATCH_SWEEP.test(p)) return true;
+  // Many targets: "all/every/each", or a standalone count of 3 or more.
+  const many = /\b(all|each|every|everyone|everybody|bulk|mass)\b/.test(p) || /\b([3-9]|\d{2,})\b/.test(p);
+  if (!many) return false;
+  // Many targets, but only being asked about: still one answer, from wherever
+  // it already is.
+  if (READ_ASK.test(p) && !BATCH_ACTION.test(p)) return false;
+  return BATCH_ACTION.test(p);
 }
 
 interface JobPlan {
@@ -2434,6 +2573,8 @@ mode — what repeats:
 
 batch is false — a single research task, not a research batch — when ONE page, list or query would answer it: "list the 3 best-selling sunglasses", "find 10 cheap flights", "show me 5 posts about X". The answer being a list does not make it a batch; the ANSWER is a list, but there is only one place to look.
 
+You are shown an excerpt of the page the user is looking at RIGHT NOW. Read it before deciding. If what was asked for is visible in it — the inbox, the conversation list, the rows — then it is already reachable and batch is false: something else will simply read that page and answer. Never ask for a list of things the excerpt shows are on the screen.
+
 batch is true with mode "research" when the answer genuinely requires opening many SEPARATE places and collecting from each: "search every table for what this user did", "go through all my open PRs and tell me which are blocked", "check each of these 20 sites for a pricing page". Each target is a separate visit, and only combining them answers the question.
 
 If the site has a query console (a SQL editor, a search/filter box, an export) that would answer the whole question at once, that is NOT a batch — it is one task. Prefer that: batch false.
@@ -2468,6 +2609,10 @@ async function planJob(
               `Request: ${prompt}`,
               `Current page: ${page.title} — ${page.url}`,
               hasAttachment ? 'The user attached a file with this message.' : 'No file attached.',
+              // Without this the planner is guessing from a URL alone, and it
+              // guesses "unknown" — which is how "list my unanswered messages",
+              // asked on the page listing them, came back as a request for a CSV.
+              ...(page.text?.trim() ? ['', 'Excerpt of that page:', page.text.slice(0, 3000)] : []),
             ].join('\n'),
           },
         ],
@@ -2983,6 +3128,7 @@ async function maybeStartJob(
   tier: { chat: string; act: string; router: string },
   message: AskRequest,
   signal: AbortSignal,
+  senderTabId: number | undefined,
 ): Promise<boolean> {
   if (!looksBatch(message.prompt)) return false;
   const existing = await loadJob();
@@ -2995,15 +3141,12 @@ async function maybeStartJob(
   const plan = await planJob(apiKey, tier.act, message.prompt, message.page, textFiles.length > 0, signal);
   if (!plan?.batch || !plan.task) return false;
 
-  // No list, and no way to get one. Asking beats inventing 1000 addresses.
-  if (plan.source === 'unknown') {
-    await pushChat(
-      plan.missing?.trim() ||
-        'I can run that as a batch, but I need the list first — attach a CSV, or point me at the page the targets are on.',
-      'assistant',
-    );
-    return true;
-  }
+  // The planner thinks there is no list anywhere. It is guessing from an
+  // excerpt, so before taking the request over to ask for a CSV, try the page
+  // the user is actually on — that is where they usually mean. If nothing is
+  // there either, the fall-through below hands the whole thing to the normal
+  // agent, which can go and look properly.
+  const source = plan.source === 'unknown' ? 'page' : plan.source;
 
   const mode = plan.mode === 'research' ? 'research' : 'act';
   const job = newJob({
@@ -3021,13 +3164,20 @@ async function maybeStartJob(
   // Build the work list. Where it comes from decides how much this costs: a
   // file or an enumerated prompt is free, a page costs one collection turn.
   let items: { label: string; key: string; data: Record<string, string> }[] = [];
-  if (plan.source === 'attachment' && textFiles.length) {
+  if (source === 'attachment' && textFiles.length) {
     items = textFiles.flatMap((f) => itemsFromCsv(f.data));
-  } else if (plan.source === 'prompt' && plan.labels?.length) {
+  } else if (source === 'prompt' && plan.labels?.length) {
     items = plan.labels.map((l) => ({ label: String(l), key: String(l).toLowerCase(), data: {} }));
   } else {
-    const tabId = await ensureJobTab(job);
-    if (job.site) {
+    // Collect from the tab the user is already on when it is the right site.
+    // A fresh tab pointed at the same URL is NOT the same page: their inbox is
+    // open, the thread list is expanded, the feed is scrolled to where they
+    // were. Reloading the bare site throws away precisely the state that made
+    // them say "they're on the page".
+    const siteHost = job.site ? hostOf(job.site) : null;
+    const onSite = senderTabId != null && !!siteHost && siteHost === hostOf(message.page.url);
+    const tabId = onSite ? senderTabId! : await ensureJobTab(job);
+    if (!onSite && job.site) {
       await browser.tabs.update(tabId, { url: job.site }).catch(() => {});
       await waitForTabLoad(tabId);
       await sleep(500);
@@ -3035,14 +3185,14 @@ async function maybeStartJob(
     items = await collectItems(apiKey, tier.act, job, plan.count ?? 0, tabId);
   }
 
+  // Nothing to run. Do NOT claim the request — the normal agent has the page,
+  // the tools and the freedom to go looking, and answering beats a dead end.
+  // This used to reply "I couldn't build the list … attach a CSV", which was
+  // both a refusal and a lie: the things asked for were usually right there.
   if (!items.length) {
     await clearJob(job);
-    await pushChat(
-      "I couldn't build the list for that — I didn't find the targets on the page, and nothing was attached. Point me at the right page, or attach a CSV, and I'll run it.",
-      'assistant',
-    );
     await setStatus(null);
-    return true;
+    return false;
   }
 
   await setItems(job, items);
