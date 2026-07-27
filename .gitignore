@@ -19,7 +19,7 @@ dist/
 !.env.example
 
 # Claude Code local state
-.claude/settings.local.json
+.claude/
 
 # Stray nested clone (git-lfs scaffolding), not part of the project
 /tidra/
