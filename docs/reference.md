@@ -82,10 +82,13 @@ Defined in `entrypoints/background.ts`. `*` = required.
 
 | Tool | Params | What it does |
 | --- | --- | --- |
-| `click` | `ref*` | Clicks; retries once as a trusted CDP click if nothing changed |
-| `fill` | `ref*`, `text*`, `submit?` | Types into a field. `submit: true` is **refused** unless confirmed or Auto |
+| `click` | `ref*` | Clicks; retries once as a trusted CDP click if nothing changed. Reports the covering element when one is in the way, and waits out any navigation it started |
+| `fill` | `ref*`, `text*`, `submit?` | Types into a field, then **reads the value back** and fails if it didn't take. `submit: true` is **refused** unless confirmed or Auto |
 | `select` | `ref*`, `option*` | Picks a `<select>` option by value or text |
 | `scroll` | `ref?`, `direction?`, `amount?` | Scrolls to an element, or by an amount |
+| `hover` | `ref*` | Mouse-over without clicking, for menus that only exist under the cursor |
+| `press_key` | `key*`, `ref?` | One key from a closed list (Escape, Tab, arrows, Home/End/PageUp/PageDown, Space, Enter, Backspace, Delete). Defaults to the focused element. `Enter` goes through the **same submit gate as `fill`** |
+| `clear` | `ref?`, `field?` | Empties a field via select-all + delete, then verifies it is empty |
 | `click_text` | `text*` | Label-match fallback when there's no ref |
 | `type_text` | `text*`, `field?`, `submit?` | Label-match fallback for `fill`; same submit gate |
 | `screenshot` | `question?` | Captures the active tab (JPEG q60), asks the vision model |
@@ -130,9 +133,12 @@ Sent as `{ type: 'tidra-action', action, … }`. Reply is
 | `get_page` | — | `{ title, url, text }` (16,000-char cap) |
 | `snapshot` | — | `{ tree, url, title, truncated }` |
 | `click` | `ref` | Report + `coords` + `changed` |
-| `fill` | `ref?`, `field?`, `text`, `submit?` | Report + `changed` |
+| `fill` | `ref?`, `field?`, `text`, `submit?` | Report, or `ok: false` when read-back shows the text didn't land |
 | `select` | `ref`, `option` | Report |
 | `scroll` | `ref?`, `amount?`, `direction?` | Report |
+| `hover` | `ref` | Report + `changed` |
+| `press_key` | `key`, `ref?` | Report + `changed`; `ok: false` for a key outside the list |
+| `clear` | `ref?`, `field?` | Report, or `ok: false` if anything is left in the field |
 | `click_text` | `text` | Report + `coords` + `changed` |
 | `type_text` | `field?`, `text`, `submit?` | Report + `changed` |
 | `attach_file` | `base64`, `name?`, `mime?`, `ref?`, `append?` | Report + `changed` |
@@ -198,7 +204,8 @@ prefix for images, raw text for text.
 
 | Key | Shape |
 | --- | --- |
-| `tidraChat` | `{ messages: {role:'user'\|'assistant'\|'error', text}[], loading: boolean }` |
+| `tidraChat` | `{ messages: ChatMsg[], loading, summary?: {text, covers}, route? }` — `ChatMsg` is `{role, text, trace?: string[], page?: {title,url}}`. `trace` is what the turn did; `summary` folds in everything past the window; `route` is the last route, for follow-ups |
+| `tidraLastImages` | `{ images: Attachment[], ts } \| null` — up to 2, carried into a follow-up for 30 min |
 | `tidraPending` | `{ label: string } \| null` — drives the Confirm bar |
 | `tidraStatus` | `string \| null` — current one-line status |
 | `tidraSteps` | `string[]` — last 40 steps |
@@ -289,7 +296,10 @@ Declared in `wxt.config.ts`.
 | Routine site agent | 24 steps |
 | Batch collector | 16 steps |
 | Batch item worker | 12 steps (per-job) |
-| Compaction trigger / tail kept | 20 messages / 8 |
+| Compaction trigger / tail kept (within a run) | 20 messages / 8 |
+| History window (between turns) | 12 messages; older folded into `summary` |
+| Trace kept per turn | 12 tool calls (600 chars for writes, 100 otherwise) |
+| Carried-image freshness | 30 min |
 | Snapshot node cap | 400 per frame |
 | Frames stitched | 12 |
 | Page text to the model | 15,000 chars (island) / 16,000 (content script) |

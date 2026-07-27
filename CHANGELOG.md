@@ -15,12 +15,39 @@ Versioning: [SemVer](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 - Full documentation set — [`docs/`](docs/), a rewritten [README](README.md), and this changelog.
+- **`hover(ref)`, `press_key(key, ref?)` and `clear(ref)`.** Hover-only menus, `Escape` to dismiss
+  an overlay, and `ArrowDown`+`Enter` to pick in a combobox were previously unreachable — the agent
+  had no verb for them, so it looped instead of failing. `press_key("Enter")` goes through the same
+  submit gate as `fill(submit: true)`.
+- **Cross-turn memory.** Each turn now stores what it actually did (`ChatMsg.trace`), where the user
+  was (`ChatMsg.page`), and — past a 12-message window — a rolling `summary` of the rest.
+- Clicks report the element covering them, when one is.
 
 ### Changed
-- _nothing yet_
+- History sent to the model is capped at a 12-message window plus the rolling summary, instead of
+  the entire conversation from its first message every turn.
+- A bare follow-up ("make it shorter", "no, more formal") inherits the previous turn's route instead
+  of being re-classified. A follow-up that names a browser action is still routed on its merits.
+- The confirm bar's approval says the draft already exists and must not be rewritten.
+- An image stays available to follow-up turns for 30 minutes.
+- The new tab seeds from, and appends to, the shared conversation.
 
 ### Fixed
-- _nothing yet_
+- **Refs were reused across snapshots.** The counter reset to 0 each snapshot, so a stale `ref_12`
+  resolved against the new tree's twelfth element: the click succeeded, on the wrong thing, silently.
+  The counter is now monotonic, so a stale ref is refused instead.
+- **Toggles reported "no visible change" and were then clicked twice.** The fingerprint compared only
+  URL, title and labels — and Like/Follow/Bookmark don't change their label. The trusted-click retry
+  fired on a click that had worked, undoing it. State attributes (including `aria-pressed`), element
+  count and visible-text length are now part of the comparison.
+- **`fill` claimed success without looking.** It now reads the value back and fails honestly when a
+  React or Lexical field discarded the write.
+- **A click that started a page load returned from the old document,** before the new one existed.
+  It now waits out the navigation and says the page changed underneath it.
+- Clicks are hit-tested, so a point covered by a sticky header or cookie banner is detected rather
+  than clicked twice through the overlay.
+- The new tab no longer overwrites the island's conversation on its first handoff.
+- "New chat" clears the rolling summary and carried image, on both surfaces.
 
 ### Removed
 - _nothing yet_

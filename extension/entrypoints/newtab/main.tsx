@@ -365,6 +365,44 @@ function FolderChip({
 
 type Turn = { role: 'user' | 'assistant'; text: string };
 
+// The shared conversation, as the background writes it. This page only ever
+// adds plain turns, but it must carry the rest through untouched — `summary` is
+// the thread's memory of everything older than the last dozen messages, `route`
+// is what stops a bare follow-up being re-routed onto a different path, and
+// `trace` is how the next turn knows what "it" refers to.
+type ChatMsg = {
+  role: 'user' | 'assistant' | 'error';
+  text: string;
+  trace?: string[];
+  page?: { title: string; url: string };
+};
+type ChatState = {
+  messages: ChatMsg[];
+  loading: boolean;
+  summary?: { text: string; covers: number };
+  route?: 'chat' | 'look' | 'act';
+};
+
+/** Write this page's turns back to the shared store, preserving everything the
+ *  background owns. Without this, a chat answered here left no trace at all —
+ *  the island, and the next agent run, had never heard of it.
+ *
+ *  Turns this page did not author are reused as the stored objects rather than
+ *  rebuilt from `{role, text}`: local state has no field for a trace, so
+ *  rebuilding would strip one off every message the agent had written. */
+async function persistTurns(turns: Turn[]): Promise<void> {
+  const { tidraChat } = await browser.storage.local.get('tidraChat');
+  const existing = (tidraChat as ChatState | undefined) ?? { messages: [], loading: false };
+  const stored = existing.messages ?? [];
+  const messages = turns
+    .filter((t) => t.text.trim())
+    .map((t, i) => {
+      const prev = stored[i];
+      return prev && prev.role === t.role && prev.text === t.text ? prev : { role: t.role, text: t.text };
+    });
+  await browser.storage.local.set({ tidraChat: { ...existing, messages, loading: false } });
+}
+
 function NewTab() {
   const [input, setInput] = useState('');
   const [turns, setTurns] = useState<Turn[]>([]);
@@ -408,12 +446,20 @@ function NewTab() {
 
   useEffect(() => {
     browser.storage.local
-      .get(['tidraGroqKey', 'tidraTier', 'tidraVisits', 'tidraRoutineCollapsed'])
-      .then(({ tidraGroqKey, tidraTier, tidraVisits, tidraRoutineCollapsed }) => {
+      .get(['tidraGroqKey', 'tidraTier', 'tidraVisits', 'tidraRoutineCollapsed', 'tidraChat'])
+      .then(({ tidraGroqKey, tidraTier, tidraVisits, tidraRoutineCollapsed, tidraChat }) => {
         setApiKey((tidraGroqKey as string) || null);
         if (typeof tidraTier === 'string') setTier(tidraTier);
         if (Array.isArray(tidraVisits)) setVisits(tidraVisits as Visit[]);
         setRoutineOpen(!tidraRoutineCollapsed);
+        // Pick up the conversation wherever it was last spoken. This page used
+        // to start blank and then, on the first handoff, overwrite `tidraChat`
+        // with its own turns — so a thread begun in the island was destroyed by
+        // a question asked here, and the agent lost everything before it.
+        const stored = (tidraChat as { messages?: Turn[] } | undefined)?.messages;
+        if (Array.isArray(stored) && stored.length) {
+          setTurns(stored.filter((m) => m.role === 'user' || m.role === 'assistant'));
+        }
       });
     inputRef.current?.focus();
   }, []);
@@ -752,6 +798,10 @@ function NewTab() {
         await handOff(text);
         return;
       }
+      // Answered here, so nothing else has written this exchange down. Persist
+      // once, at the end — the shared store is what the next turn reads, on
+      // whichever surface it happens.
+      void persistTurns([...history, { role: 'assistant', text: acc }]);
     } catch (err) {
       if (!abort.signal.aborted) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -784,13 +834,19 @@ function NewTab() {
     // conversation from tidraChat, so seeding it with only the new message is
     // what makes a follow-up land in an empty room: "what are these?" arrives
     // with nothing to resolve "these" against, and the agent asks for a URL.
-    // `turns` here is still the pre-message value — this runs inside the same
-    // closure that queued the new turn — so it is exactly the prior history.
-    const prior = turns
-      .filter((t) => t.text.trim())
-      .map((t) => ({ role: t.role, text: t.text }));
+    //
+    // Append to what is already stored rather than replacing it with this page's
+    // `turns`. The two are normally the same thread — this page seeds itself
+    // from the store on mount — but the store is the one that also carries the
+    // rolling summary, the last route, and each turn's trace, and rebuilding it
+    // from local state threw all of that away.
+    const { tidraChat } = await browser.storage.local.get('tidraChat');
+    const existing = (tidraChat as ChatState | undefined) ?? { messages: [], loading: false };
+    const prior = existing.messages?.length
+      ? existing.messages
+      : turns.filter((t) => t.text.trim()).map((t) => ({ role: t.role, text: t.text }) as ChatMsg);
     await browser.storage.local.set({
-      tidraChat: { messages: [...prior, { role: 'user', text }], loading: true },
+      tidraChat: { ...existing, messages: [...prior, { role: 'user', text }], loading: true },
       tidraPending: null,
       tidraUnread: false,
       tidraOpen: true,
@@ -842,6 +898,15 @@ function NewTab() {
     setTurns([]);
     setInput('');
     setReactions({});
+    // Clear the shared thread too, summary and all. "New chat" has to mean the
+    // same thing here as it does in the island, or the next question inherits a
+    // conversation the user believes they just ended.
+    void browser.storage.local.set({
+      tidraChat: { messages: [], loading: false },
+      tidraPending: null,
+      tidraUnread: false,
+      tidraLastImages: null,
+    });
     inputRef.current?.focus();
   }
 

@@ -53,6 +53,35 @@ request: `chat` (answer from what's already here), `look` (research in a hidden 
 `act` (drive the tab in front of you). You can override it with a skill's mode.
 **Code:** `background.ts` (`classify`) · **Doc:** [architecture.md](architecture.md#routing)
 
+### Conversation memory ✅
+A follow-up knows what came before it. Each turn stores the tool calls it made — including any text
+it drafted — so "make it shorter", "no, more formal" or "use the other one" resolve against what
+actually happened rather than against the one sentence Tidra said last. Past 12 messages the older
+turns are folded into a rolling summary instead of being re-sent in full, and each turn remembers
+which page it was asked on.
+
+A bare follow-up also keeps the previous turn's route, so it can't be re-classified onto a hidden
+tab halfway through a task. An attached image stays available for 30 minutes.
+**Use it:** "reply to this post" → "make it shorter" → "actually make it funnier".
+**Code:** `background.ts` (`ChatMsg.trace`, `summariseOverflow`, `inheritRoute`) ·
+**Doc:** [architecture.md](architecture.md#between-turns--what-the-next-turn-remembers)
+
+### Reaching hover menus, dropdowns and modals ✅
+`hover` opens a menu that only exists under the cursor. `press_key` sends `Escape` to dismiss an
+overlay in the way, `ArrowDown`+`Enter` to choose in an autocomplete or combobox, `Tab` to move on.
+`clear` empties a field properly. Without these the agent had no verb for a whole class of page, and
+looped rather than failing.
+**Code:** `entrypoints/content/actions.ts` · **Doc:** [architecture.md](architecture.md#reaching-what-a-click-cant)
+
+### Honest action reports ✅
+Every action says what actually changed, and is believed only when it can prove it. `fill` reads the
+field back and fails if a React or Lexical editor discarded the write. A click detects the cookie
+banner covering it and names it, waits out any navigation it started, and notices a toggle whose
+label never moved (Like, Follow, Bookmark) instead of reporting "no visible change" and being
+clicked a second time.
+**Code:** `actions.ts` (`fingerprint`, `describeChange`, `hitPoint`, `readBack`) ·
+**Doc:** [architecture.md](architecture.md#settling-and-change-detection)
+
 ### Background research (`look`) ✅
 Research-y questions open a **hidden tab** Tidra owns, so your current page is never disturbed.
 When it's done it can offer to bring you to what it found (`focus_background`, valid for 20 min).

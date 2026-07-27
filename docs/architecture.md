@@ -66,7 +66,21 @@ to `act`.
 
 1. A **skill** with an explicit mode wins outright.
 2. A **batch request** is intercepted before routing (see [batch-jobs.md](batch-jobs.md)).
-3. Otherwise the classifier decides.
+3. A **bare follow-up inherits the previous turn's route** (`ChatState.route`).
+4. Otherwise the classifier decides.
+
+### Why follow-ups inherit
+
+`inheritRoute()` returns the last route when the message is short (<= 80 chars), reads like a
+continuation (a pronoun, or an opening "no"/"ok"/"and"), and does **not** name a browser action.
+
+This is not an optimisation. Re-classifying "make it shorter" on its own could come back `look` —
+and a look runs on a hidden tab *and* strips the current page out of the prompt. A follow-up to an
+act-run would then wake up somewhere else, with no page and no idea what it had been doing. From
+the outside that is indistinguishable from amnesia.
+
+The `ACTION_VERB` escape hatch matters as much as the rule: "now reply to it" after a chat answer
+is a genuinely new request, and must be routed on its merits rather than inherited as `chat`.
 
 `look` runs on a dedicated hidden tab (`tidraAgentTab`, session storage) so your current page
 is never disturbed. Where it finished is remembered for 20 minutes in `tidraBg`; within that
@@ -93,7 +107,7 @@ out of steps? one "second wind" with a compacted transcript (30 more) → 60 max
 Other loops in the codebase, with their own budgets: routine site agent **24** steps, batch item
 collector **16**, per-job-item worker **12** (configurable per job).
 
-There are ~20 tools; the exact list with parameters is in
+There are ~23 tools; the exact list with parameters is in
 [reference.md](reference.md#agent-tools).
 
 ---
@@ -115,6 +129,28 @@ It never escalates off the vision model — if you attached an image, that run s
 ---
 
 ## Context management
+
+### Between turns — what the next turn remembers
+
+A turn used to leave behind exactly one thing: the final sentence it said. Everything else — the
+snapshot, the clicks, the text it drafted — lived in the run's local `messages` array and died when
+the run returned. So "make it shorter" arrived with nothing to shorten, and the honest description
+of what the user experienced is that Tidra had forgotten the conversation.
+
+Three things now survive a turn, all on `tidraChat`:
+
+| | What | Why |
+| --- | --- | --- |
+| `ChatMsg.trace` | up to 12 tool calls, abbreviated (600 chars for `fill`/`type_text`/`create_report`, 100 for the rest) | So a follow-up can resolve "it", and so the draft itself is still there. Replayed into history as `[What I did that turn: ...]` |
+| `ChatMsg.page` | `{title, url}` of where the user was standing | The full page text only ever rides on the newest turn — without this breadcrumb a page referred to two turns later left no trace at all, not even its URL |
+| `ChatState.summary` | `{text, covers}` | Everything past the **12-message window**, folded into one paragraph by the small model. `covers` is how much is already in it, so each overflow extends the summary instead of re-reading the whole thread |
+
+`ChatState.route` is kept too — see [Routing](#routing).
+
+> A trace is written once and never rewritten, which is what keeps it cache-safe. A recap that slid
+> along with the conversation would rewrite history every turn and cost the prefix cache.
+
+### Within a run
 
 Two mechanisms keep long runs from filling the window with dead weight:
 
@@ -172,9 +208,15 @@ on every call by a substring match.
   always listed because an unnamed text field is exactly the thing you need to fill.
 - Caps at **400 nodes**, and says so when it truncates.
 
-> ⚠️ **`snapshot()` resets the ref counter to 0 every time it's called.** Refs from an earlier
-> snapshot don't just go stale — their numbers get **reused**. This is why superseded snapshots
-> are pruned from context, and why every stale-ref error says "take a new snapshot."
+**Refs are never reused.** Each snapshot clears the registry, but the counter keeps climbing, so a
+number is handed out once per page lifetime.
+
+It used to reset to 0. A ref the model was still carrying from an older tree then resolved against
+the *new* tree's element at that index — the click succeeded, on the wrong thing, and nothing
+anywhere reported a problem. Monotonic numbering turns that silent misfire into an honest
+"stale — take a new snapshot".
+
+Superseded snapshots are still pruned from context, for the token cost.
 
 ### Settling and change detection
 
@@ -182,16 +224,43 @@ After every action, the content script waits for the DOM to go quiet — a `Muta
 resolves after **300ms of no mutations**, capped at 2.5s (6s for file attachment, because
 previews are slow).
 
-Then it compares a **fingerprint** taken before the action (URL, title, and up to 120
-interactive element labels) with one taken after, and reports in plain language:
+Then it compares a **fingerprint** taken before the action with one taken after, and reports in
+plain language. The loud signals first:
 
 - `navigated to https://…`
+- `title is now "…"`
 - `new on screen: "Send", "Discard"`
 - `3 element(s) disappeared`
+
+If none of those fired, the quiet ones are consulted — a control's `aria-checked` /
+`aria-expanded` / `aria-selected` / `aria-pressed` / `aria-current` or field length changing, the
+interactive-element count changing, the visible text growing or shrinking by more than 20
+characters, focus landing somewhere unexpected, the page scrolling more than 40px. Failing all of
+that:
+
 - `no visible change — the action may not have registered`
 
 That last string is what drives both the [trusted-click retry](#trusted-clicks) and the
 [model cascade](#the-model-cascade). A click that did nothing must never look like success.
+
+### Why the quiet signals exist
+
+Labels alone were not enough, and the gap was doing real damage. Clicking Like leaves a button
+still labelled "Like"; ticking a checkbox, opening a menu whose items are named the same,
+incrementing a counter — none of them move a label. Every one of those came back "no visible
+change", so the trusted-click retry fired and **performed the action a second time**: liked then
+unliked, sent twice. It also fed `badStreak` and escalated the run to the expensive model for
+nothing. `aria-pressed` in particular is how most toggles on a social site report themselves.
+
+The reverse error is worse, so two things are deliberately excluded from counting as change:
+
+- **The action's own scroll.** `click` brings the element into view *before* the "before"
+  fingerprint is taken. Scrolling after the mark made every click report "the page scrolled".
+- **The action's own focus.** `describeChange` takes the name of the element the action focused on
+  purpose and ignores focus landing there.
+
+Without those two exclusions every click reported `changed: true`, which would have switched the
+trusted-click retry off entirely — the exact opposite of the rule above.
 
 ### Typing into modern editors
 
@@ -206,6 +275,26 @@ That last string is what drives both the [trusted-click retry](#trusted-clicks) 
 `pressEnter()` has a double-send guard: it returns early for composers (where Enter means
 newline), and if the page called `preventDefault()` on the keydown it does **not** fall through
 to `form.requestSubmit()`.
+
+**Every write is read back.** `fill` and `type_text` re-read the field after settling and fail with
+a real error if what came back isn't what went in — "the field did not take the text", or "it is
+still empty". They used to report `Typed into "X".` unconditionally, which was a lie roughly as
+often as a React-controlled input silently discards a programmatic write. A read-back is skipped
+only when `submit` was set, because a sent field is legitimately empty afterwards.
+
+### Reaching what a click can't
+
+`click`/`fill`/`select`/`scroll` cannot express three common page behaviours, and when the model
+had no verb for something it did not fail cleanly — it looped taking snapshots of a page whose menu
+it could not open:
+
+- **`hover(ref)`** — menus and action rows that only exist under the cursor. If a control isn't in
+  the tree at all, this is usually why.
+- **`press_key(key, ref?)`** — `Escape` to dismiss a modal or cookie layer that is in the way,
+  `ArrowDown` + `Enter` to choose in an autocomplete or combobox (which is how those are picked,
+  not by clicking the option), `Tab` to move on. A closed list of keys, not free text.
+- **`clear(ref)`** — select-all + delete, then verify. Setting `value = ''` skips the events rich
+  editors need and leaves React's tracker believing the old text is still there.
 
 ---
 
@@ -223,6 +312,14 @@ is indistinguishable from a mouse.
 - Sub-frames are excluded from the retry because their coordinates are frame-relative.
 - `click_at(x, y)` is CDP-only, and divides by the screenshot scale factor so vision-model
   coordinates land in the right place.
+
+**The click point is hit-tested first.** `hitPoint()` tries the element's centre, then points inset
+from each edge, and takes the first one where `elementFromPoint` actually returns the element (or a
+descendant, or a containing shadow host). If none of them do *and* something else was found on top,
+the report names it — "a cookie banner is on top of it" sends the model to close the banner, where
+"no visible change" only sent it back to click the same covered pixel again. When every candidate
+comes back empty the element simply has no layout, and nothing is claimed: an unmeasurable element
+must not be reported as an obstructed one.
 
 ---
 
@@ -250,9 +347,11 @@ Prompt instructions alone are not a safety mechanism. Confirmation is enforced f
 
 1. **The system prompt** names what's irreversible: send, publish, submit, purchase, transfer,
    delete.
-2. **A code gate.** `fill`/`type_text` with `submit: true` returns a hard refusal unless the
-   user confirmed or Auto mode is on. `allowSubmit` is computed in the background, not by the
-   model.
+2. **A code gate.** `fill`/`type_text` with `submit: true`, and `press_key` with `Enter`, return a
+   hard refusal unless the user confirmed or Auto mode is on. `allowSubmit` is computed in the
+   background, not by the model. The gate is about the *effect*, not the tool: `press_key` was very
+   nearly a hole straight through it, because Enter in a composer sends and a key press is not a
+   fill.
 3. **The `confirm_action` tool** ends the turn and raises the Confirm bar. Approving sends a new
    request prefixed `Confirmed — `, which is the *only* thing that sets `userConfirmed`.
 4. **Auto mode** answers a `confirm_action` in-loop with a synthetic approval instead of
@@ -341,6 +440,10 @@ If you change one of these, know that you're changing it.
 | Per-run context goes in the newest user message | Same reason |
 | Fire-and-forget requests, results via storage | Survives the worker dying; lets a thread move between surfaces |
 | Every action reports what actually changed | A no-op click must never look like success |
+| An action's own scroll and focus don't count as change | Otherwise every click looks successful and the retry never fires |
+| `fill` reads the value back | React and Lexical accept a write and discard it often enough that "typed" without looking is a coin flip |
+| Refs are never reused | A reused number is a silent click on the wrong element |
+| A turn's trace outlives the turn | One sentence of history is not enough to resolve "make it shorter" |
 | `allowSubmit` is computed in the background | The model must not be able to talk its way into sending |
 | Read-only modes omit tools rather than forbidding them | Structural safety beats prompt safety |
 | Superseded snapshots are pruned | Page trees are the biggest context consumer |

@@ -345,6 +345,12 @@ function fingerprint(): Fingerprint {
         el.getAttribute('aria-checked') ?? (typeof anyEl.checked === 'boolean' ? String(anyEl.checked) : ''),
         el.getAttribute('aria-expanded') ?? '',
         el.getAttribute('aria-selected') ?? '',
+        // aria-pressed is how a toggle button — Like, Follow, Bookmark, Mute —
+        // says it flipped. Its label very often does not change at all, so
+        // without this the single most common "did my click land?" question on
+        // a social site had no answer but "no visible change".
+        el.getAttribute('aria-pressed') ?? '',
+        el.getAttribute('aria-current') ?? '',
         typeof anyEl.value === 'string' ? String(anyEl.value.length) : '',
       ].join('');
       if (bits) states.push(bits);
@@ -363,7 +369,13 @@ function fingerprint(): Fingerprint {
   };
 }
 
-function describeChange(before: Fingerprint, after: Fingerprint): string {
+/**
+ * @param selfFocus the element this action deliberately focused. Focus landing
+ *   there is the action's own doing, not the page reacting to it — counting it
+ *   as a change would mark every click "changed" and switch off the trusted
+ *   retry that exists for clicks which did nothing.
+ */
+function describeChange(before: Fingerprint, after: Fingerprint, selfFocus?: string): string {
   const bits: string[] = [];
   if (before.url !== after.url) bits.push(`navigated to ${after.url}`);
   else if (before.title !== after.title) bits.push(`title is now "${after.title}"`);
@@ -385,7 +397,9 @@ function describeChange(before: Fingerprint, after: Fingerprint): string {
     }
     const dText = after.textLen - before.textLen;
     if (Math.abs(dText) > 20) bits.push(`page text ${dText > 0 ? 'grew' : 'shrank'} by ${Math.abs(dText)} characters`);
-    if (before.focus !== after.focus && after.focus) bits.push(`focus moved to "${after.focus}"`);
+    if (before.focus !== after.focus && after.focus && after.focus !== selfFocus) {
+      bits.push(`focus moved to "${after.focus}"`);
+    }
     if (Math.abs(after.scrollY - before.scrollY) > 40) bits.push(`the page scrolled to ${after.scrollY}px`);
   }
   return bits.length ? bits.join('; ') : 'no visible change — the action may not have registered';
@@ -433,16 +447,26 @@ function hitPoint(el: HTMLElement): { x: number; y: number; blockedBy: string | 
     if (top && !blocker) blocker = top;
   }
 
-  const name = blocker ? accName(blocker) || blocker.tagName.toLowerCase() : 'something';
+  // Only claim obstruction when something was actually found on top. Every
+  // candidate can also come back empty because the element has no layout, or
+  // sits outside a viewport this document does not really have (a background
+  // tab that never painted) — and "a cookie banner is covering it" is a bad
+  // thing to tell the model when the truth is "I could not measure".
   return {
     x: Math.round(r.left + r.width / 2),
     y: Math.round(r.top + r.height / 2),
-    blockedBy: name.slice(0, 60),
+    blockedBy: blocker ? (accName(blocker) || blocker.tagName.toLowerCase()).slice(0, 60) : null,
   };
 }
 
-function realClick(el: HTMLElement): { x: number; y: number; blockedBy: string | null } {
+/** Bring the target into view BEFORE the "before" fingerprint is taken.
+ *  Scrolling is something the action does to itself; if it happens after the
+ *  mark, every click reports "the page scrolled" and looks like it worked. */
+function bringIntoView(el: HTMLElement) {
   el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' as ScrollBehavior });
+}
+
+function realClick(el: HTMLElement): { x: number; y: number; blockedBy: string | null } {
   const spot = hitPoint(el);
   const clientX = spot.x;
   const clientY = spot.y;
@@ -567,7 +591,6 @@ function clearField(el: HTMLElement) {
 // this the tree simply never contains the thing the user is asking for, and the
 // model loops taking snapshots of a page whose menu it cannot open.
 function hoverOver(el: HTMLElement) {
-  el.scrollIntoView({ block: 'center', behavior: 'instant' as ScrollBehavior });
   const { x: clientX, y: clientY } = hitPoint(el);
   const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX, clientY };
   const ptr = { ...base, pointerId: 1, pointerType: 'mouse', isPrimary: true };
@@ -887,11 +910,12 @@ async function handle(msg: any): Promise<Reply> {
       const el = get(msg.ref);
       if (!el) return { ok: false, error: STALE(msg.ref) };
       const name = accName(el) || el.tagName.toLowerCase();
+      bringIntoView(el);
       const before = fingerprint();
       lastBefore = before;
       const { x, y, blockedBy } = realClick(el);
       await settle();
-      const change = describeChange(before, fingerprint());
+      const change = describeChange(before, fingerprint(), name);
       // Say what is covering the button. "no visible change" sends the model
       // back to click the same thing again; "a cookie banner is on top of it"
       // sends it to close the banner, which is the move that actually works.
@@ -935,10 +959,11 @@ async function handle(msg: any): Promise<Reply> {
       const el = get(msg.ref);
       if (!el) return { ok: false, error: STALE(msg.ref) };
       const name = accName(el) || el.tagName.toLowerCase();
+      bringIntoView(el);
       const before = fingerprint();
       hoverOver(el);
       await settle(1200);
-      const change = describeChange(before, fingerprint());
+      const change = describeChange(before, fingerprint(), name);
       return { ok: true, data: `Hovered "${name}". ${change}`, changed: !change.startsWith(NO_CHANGE) };
     }
 
@@ -1008,11 +1033,12 @@ async function handle(msg: any): Promise<Reply> {
       const el = findClickable(msg.text);
       if (!el) return { ok: false, error: `No clickable element matching "${msg.text}"` };
       const name = accName(el);
+      bringIntoView(el);
       const before = fingerprint();
       lastBefore = before;
       const { x, y, blockedBy } = realClick(el);
       await settle();
-      const change = describeChange(before, fingerprint());
+      const change = describeChange(before, fingerprint(), name);
       const note = blockedBy ? ` Note: "${blockedBy}" is on top of it and may have taken the click instead.` : '';
       return {
         ok: true,
