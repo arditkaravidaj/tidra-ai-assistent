@@ -959,6 +959,16 @@ async function pushChat(
 
 /** Recent messages sent verbatim. Everything older lives in the summary. */
 const HISTORY_WINDOW = 12;
+/**
+ * How many messages must fall out of the window before they are folded in.
+ *
+ * Without this the fold ran before every single turn of a long thread — a
+ * blocking network round-trip in front of each request, to restate a summary
+ * that had moved by one exchange. Folding in batches means the window
+ * temporarily carries up to this many extra messages verbatim, which is cheaper
+ * than the call and much cheaper than the latency.
+ */
+const SUMMARY_BATCH = 6;
 /** Tool calls kept per turn. Enough to reconstruct what happened, not a log. */
 const TRACE_KEEP = 12;
 
@@ -974,7 +984,7 @@ const THREAD_SUMMARY_SYSTEM = `You maintain a running summary of a conversation 
 async function summariseOverflow(apiKey: string, chat: ChatState, signal?: AbortSignal): Promise<void> {
   const covered = chat.summary?.covers ?? 0;
   const overflowEnd = chat.messages.length - HISTORY_WINDOW;
-  if (overflowEnd <= covered) return;
+  if (overflowEnd - covered < SUMMARY_BATCH) return;
 
   const chunk = chat.messages
     .slice(covered, overflowEnd)
@@ -2065,7 +2075,13 @@ async function handleAsk(message: AskRequest, senderTabId: number | undefined) {
     });
   }
   const threadSummary = stored.length > HISTORY_WINDOW ? chatState.summary?.text ?? null : null;
-  const history = stored.slice(-HISTORY_WINDOW).filter((m) => m.role !== 'error');
+  // Start where the summary stops, so a message that has fallen out of the
+  // window but is not yet folded in is still sent rather than silently dropped.
+  // Hard-bounded, so a thread whose summarisation keeps failing cannot grow the
+  // window without limit — losing the middle is the honest fallback there.
+  const covered = chatState.summary?.covers ?? 0;
+  const windowStart = Math.max(covered, stored.length - (HISTORY_WINDOW + SUMMARY_BATCH));
+  const history = stored.slice(windowStart).filter((m) => m.role !== 'error');
 
   // Slash skills: "/fact-check the stats" expands into the saved prompt before
   // the model sees it. The chat keeps showing what the user typed; only the
