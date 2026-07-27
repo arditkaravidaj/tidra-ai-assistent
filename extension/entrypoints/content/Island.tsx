@@ -20,6 +20,11 @@ interface ChatMsg {
   text: string;
   /** Thumbnails/names kept so the bubble still shows what was attached. */
   files?: { kind: 'image' | 'text'; name: string; thumb?: string }[];
+  /** Written by the background, never read here — but it must survive a
+   *  round-trip through this component, which rewrites the chat on every send.
+   *  It is what the next turn uses to know what "it" means. */
+  trace?: string[];
+  page?: { title: string; url: string };
 }
 
 const MAX_ATTACHMENTS = 4;
@@ -75,6 +80,11 @@ function readTextFile(file: File): Promise<Attachment> {
 interface ChatState {
   messages: ChatMsg[];
   loading: boolean;
+  /** Both belong to the background. They are declared here so that rebuilding
+   *  the state on send carries them through instead of quietly deleting the
+   *  thread's long-term memory and its route. */
+  summary?: { text: string; covers: number };
+  route?: 'chat' | 'look' | 'act';
 }
 
 const EMPTY: ChatState = { messages: [], loading: false };
@@ -690,6 +700,9 @@ export function Island() {
     setFiles([]);
     setPending(null);
     const next: ChatState = {
+      // Spread the whole state, not just the messages: `summary` and `route`
+      // live here too, and rebuilding the object from scratch used to drop both.
+      ...chat,
       messages: [
         ...chat.messages,
         {
@@ -761,13 +774,21 @@ export function Island() {
   function confirmSend() {
     const label = pending?.label ?? 'Send';
     setPending(null);
-    ask(`Confirmed — ${label.toLowerCase()} it now by clicking the button on the page.`, 'act');
+    // "…by clicking the button on the page" used to be all the next run had to
+    // go on: a brand-new turn, no memory of what was drafted or where. It now
+    // arrives alongside that turn's trace, so say plainly that the draft already
+    // exists — otherwise a model that cannot see one writes a fresh one.
+    ask(
+      `Confirmed — go ahead and ${label.toLowerCase()} it now. Use the draft that is already on the page; do not rewrite or re-type it. Take a snapshot first to find the button.`,
+      'act',
+    );
   }
 
   async function confirmCancel() {
     setPending(null);
     setUnread(false);
     const next: ChatState = {
+      ...chat,
       messages: [...chat.messages, { role: 'assistant', text: 'Okay — cancelled. Nothing was sent.' }],
       loading: false,
     };
@@ -941,7 +962,15 @@ export function Island() {
     setReactions({});
     setInput('');
     setUnread(false);
-    browser.storage.local.set({ tidraChat: empty, tidraPending: null, tidraUnread: false });
+    // `empty` carries no summary and no route, so the thread's long-term memory
+    // goes with it — a new chat must not inherit the last one's. The carried
+    // image goes too, for the same reason.
+    browser.storage.local.set({
+      tidraChat: empty,
+      tidraPending: null,
+      tidraUnread: false,
+      tidraLastImages: null,
+    });
     inputRef.current?.focus();
   }
 

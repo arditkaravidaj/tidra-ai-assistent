@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="assets/tidra-logo.svg" alt="Tidra" width="440">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/tidra-logo-dark.svg">
+    <img src="assets/tidra-logo.svg" alt="Tidra" width="360">
+  </picture>
 </p>
 
 <h3 align="center">An AI assistant that lives in your browser.</h3>
