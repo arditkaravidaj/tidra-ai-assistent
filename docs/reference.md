@@ -297,7 +297,8 @@ Declared in `wxt.config.ts`.
 | Batch collector | 16 steps |
 | Batch item worker | 12 steps (per-job) |
 | Compaction trigger / tail kept (within a run) | 20 messages / 8 |
-| History window (between turns) | 12 messages; older folded into `summary` |
+| History window (between turns) | 12 messages, plus up to 6 awaiting the fold (18 max) |
+| Summary fold batch | 6 messages — avoids a blocking call before every turn |
 | Trace kept per turn | 12 tool calls (600 chars for writes, 100 otherwise) |
 | Carried-image freshness | 30 min |
 | Snapshot node cap | 400 per frame |

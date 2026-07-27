@@ -143,7 +143,7 @@ Three things now survive a turn, all on `tidraChat`:
 | --- | --- | --- |
 | `ChatMsg.trace` | up to 12 tool calls, abbreviated (600 chars for `fill`/`type_text`/`create_report`, 100 for the rest) | So a follow-up can resolve "it", and so the draft itself is still there. Replayed into history as `[What I did that turn: ...]` |
 | `ChatMsg.page` | `{title, url}` of where the user was standing | The full page text only ever rides on the newest turn — without this breadcrumb a page referred to two turns later left no trace at all, not even its URL |
-| `ChatState.summary` | `{text, covers}` | Everything past the **12-message window**, folded into one paragraph by the small model. `covers` is how much is already in it, so each overflow extends the summary instead of re-reading the whole thread |
+| `ChatState.summary` | `{text, covers}` | Everything past the **12-message window**, folded into one paragraph by the small model. `covers` is how much is already in it, so each overflow extends the summary instead of re-reading the whole thread. Folding waits for **6** messages to accumulate — done eagerly it put a blocking network call in front of every turn of a long thread |
 
 `ChatState.route` is kept too — see [Routing](#routing).
 
